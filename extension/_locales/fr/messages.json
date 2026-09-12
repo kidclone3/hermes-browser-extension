@@ -3167,6 +3167,10 @@
     "message": "Compétences Hermes synchronisées",
     "description": "Runtime interface message ui.hermes.skills.synced"
   },
+  "runtime_ui_hermes_subagent_status": {
+    "message": "Statut des sous-agents Hermes",
+    "description": "Runtime interface message ui.hermes.subagent.status"
+  },
   "runtime_ui_hermes_task_status": {
     "message": "Statut de la tâche Hermes",
     "description": "Runtime interface message ui.hermes.task.status"
@@ -3410,6 +3414,10 @@
   "runtime_ui_list": {
     "message": "Liste",
     "description": "Runtime interface message ui.list"
+  },
+  "runtime_ui_live_subagents": {
+    "message": "Sous-agents actifs",
+    "description": "Runtime interface message ui.live.subagents"
   },
   "runtime_ui_load_unpacked_installs_update_through_a_guarded_hermes_agent_tu_410111a9": {
     "message": "Chargez la mise à jour des installations décompressées via un tour d'agent Hermes gardé, puis rechargez le dossier dist/ construit.",
@@ -4834,6 +4842,10 @@
   "runtime_ui_stream": {
     "message": "Flux",
     "description": "Runtime interface message ui.stream"
+  },
+  "runtime_ui_subagents": {
+    "message": "SOUS-AGENTS",
+    "description": "Runtime interface message ui.subagents"
   },
   "runtime_ui_submit": {
     "message": "Soumettre",

@@ -3167,6 +3167,10 @@
     "message": "Các kỹ năng Hermes đã được đồng bộ hóa",
     "description": "Runtime interface message ui.hermes.skills.synced"
   },
+  "runtime_ui_hermes_subagent_status": {
+    "message": "Trạng thái tác tử con Hermes",
+    "description": "Runtime interface message ui.hermes.subagent.status"
+  },
   "runtime_ui_hermes_task_status": {
     "message": "Trạng thái nhiệm vụ Hermes",
     "description": "Runtime interface message ui.hermes.task.status"
@@ -3410,6 +3414,10 @@
   "runtime_ui_list": {
     "message": "Danh sách",
     "description": "Runtime interface message ui.list"
+  },
+  "runtime_ui_live_subagents": {
+    "message": "Tác tử con đang chạy",
+    "description": "Runtime interface message ui.live.subagents"
   },
   "runtime_ui_load_unpacked_installs_update_through_a_guarded_hermes_agent_tu_410111a9": {
     "message": "Cập nhật các bản cài đặt đã giải nén tải thông qua lượt tác nhân Hermes được bảo vệ, sau đó tải lại thư mục dist/ đã xây dựng.",
@@ -4834,6 +4842,10 @@
   "runtime_ui_stream": {
     "message": "Truyền phát",
     "description": "Runtime interface message ui.stream"
+  },
+  "runtime_ui_subagents": {
+    "message": "TÁC TỬ CON",
+    "description": "Runtime interface message ui.subagents"
   },
   "runtime_ui_submit": {
     "message": "Gửi",

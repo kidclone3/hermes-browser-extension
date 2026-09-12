@@ -3167,6 +3167,10 @@
     "message": "Hermes habilidades sincronizadas",
     "description": "Runtime interface message ui.hermes.skills.synced"
   },
+  "runtime_ui_hermes_subagent_status": {
+    "message": "Hermes status dos subagentes",
+    "description": "Runtime interface message ui.hermes.subagent.status"
+  },
   "runtime_ui_hermes_task_status": {
     "message": "Hermes status da tarefa",
     "description": "Runtime interface message ui.hermes.task.status"
@@ -3410,6 +3414,10 @@
   "runtime_ui_list": {
     "message": "Lista",
     "description": "Runtime interface message ui.list"
+  },
+  "runtime_ui_live_subagents": {
+    "message": "Subagentes ativos",
+    "description": "Runtime interface message ui.live.subagents"
   },
   "runtime_ui_load_unpacked_installs_update_through_a_guarded_hermes_agent_tu_410111a9": {
     "message": "As instalações descompactadas são atualizadas por meio de um turno do agente Hermes protegido e, em seguida, recarregam a pasta dist/ construída.",
@@ -4834,6 +4842,10 @@
   "runtime_ui_stream": {
     "message": "Transmitir",
     "description": "Runtime interface message ui.stream"
+  },
+  "runtime_ui_subagents": {
+    "message": "SUBAGENTES",
+    "description": "Runtime interface message ui.subagents"
   },
   "runtime_ui_submit": {
     "message": "Enviar",

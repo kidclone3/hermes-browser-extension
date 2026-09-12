@@ -3167,6 +3167,10 @@
     "message": "Keterampilan Hermes disinkronkan",
     "description": "Runtime interface message ui.hermes.skills.synced"
   },
+  "runtime_ui_hermes_subagent_status": {
+    "message": "Hermes status subagen",
+    "description": "Runtime interface message ui.hermes.subagent.status"
+  },
   "runtime_ui_hermes_task_status": {
     "message": "Hermes status tugas",
     "description": "Runtime interface message ui.hermes.task.status"
@@ -3410,6 +3414,10 @@
   "runtime_ui_list": {
     "message": "Daftar",
     "description": "Runtime interface message ui.list"
+  },
+  "runtime_ui_live_subagents": {
+    "message": "Subagen aktif",
+    "description": "Runtime interface message ui.live.subagents"
   },
   "runtime_ui_load_unpacked_installs_update_through_a_guarded_hermes_agent_tu_410111a9": {
     "message": "Muat pembaruan pemasangan yang belum dibongkar melalui giliran agen Hermes yang dijaga, lalu muat ulang folder dist/ yang dibuat.",
@@ -4834,6 +4842,10 @@
   "runtime_ui_stream": {
     "message": "Sungai kecil",
     "description": "Runtime interface message ui.stream"
+  },
+  "runtime_ui_subagents": {
+    "message": "SUBAGEN",
+    "description": "Runtime interface message ui.subagents"
   },
   "runtime_ui_submit": {
     "message": "Kirim",

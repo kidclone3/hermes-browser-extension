@@ -3167,6 +3167,10 @@
     "message": "Hermes कौशल समन्वयित",
     "description": "Runtime interface message ui.hermes.skills.synced"
   },
+  "runtime_ui_hermes_subagent_status": {
+    "message": "Hermes उप-एजेंट स्थिति",
+    "description": "Runtime interface message ui.hermes.subagent.status"
+  },
   "runtime_ui_hermes_task_status": {
     "message": "Hermes कार्य स्थिति",
     "description": "Runtime interface message ui.hermes.task.status"
@@ -3410,6 +3414,10 @@
   "runtime_ui_list": {
     "message": "सूची",
     "description": "Runtime interface message ui.list"
+  },
+  "runtime_ui_live_subagents": {
+    "message": "सक्रिय उप-एजेंट",
+    "description": "Runtime interface message ui.live.subagents"
   },
   "runtime_ui_load_unpacked_installs_update_through_a_guarded_hermes_agent_tu_410111a9": {
     "message": "एक संरक्षित Hermes एजेंट टर्न के माध्यम से लोड-अनपैक्ड इंस्टॉल अपडेट, फिर निर्मित dist/ फ़ोल्डर को पुनः लोड करें।",
@@ -4834,6 +4842,10 @@
   "runtime_ui_stream": {
     "message": "धारा",
     "description": "Runtime interface message ui.stream"
+  },
+  "runtime_ui_subagents": {
+    "message": "उप-एजेंट",
+    "description": "Runtime interface message ui.subagents"
   },
   "runtime_ui_submit": {
     "message": "जमा करना",

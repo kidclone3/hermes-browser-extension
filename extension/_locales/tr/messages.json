@@ -3167,6 +3167,10 @@
     "message": "Hermes becerileri senkronize edildi",
     "description": "Runtime interface message ui.hermes.skills.synced"
   },
+  "runtime_ui_hermes_subagent_status": {
+    "message": "Hermes alt ajan durumu",
+    "description": "Runtime interface message ui.hermes.subagent.status"
+  },
   "runtime_ui_hermes_task_status": {
     "message": "Hermes görev durumu",
     "description": "Runtime interface message ui.hermes.task.status"
@@ -3410,6 +3414,10 @@
   "runtime_ui_list": {
     "message": "Liste",
     "description": "Runtime interface message ui.list"
+  },
+  "runtime_ui_live_subagents": {
+    "message": "Etkin alt ajanlar",
+    "description": "Runtime interface message ui.live.subagents"
   },
   "runtime_ui_load_unpacked_installs_update_through_a_guarded_hermes_agent_tu_410111a9": {
     "message": "Yüklenmemiş yüklemeler, korumalı bir Hermes aracısı aracılığıyla güncelleme yapar, ardından yerleşik dağıtım/klasörü yeniden yükler.",
@@ -4834,6 +4842,10 @@
   "runtime_ui_stream": {
     "message": "Akış",
     "description": "Runtime interface message ui.stream"
+  },
+  "runtime_ui_subagents": {
+    "message": "ALT AJANLAR",
+    "description": "Runtime interface message ui.subagents"
   },
   "runtime_ui_submit": {
     "message": "Gönder",

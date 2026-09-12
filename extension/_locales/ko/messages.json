@@ -3167,6 +3167,10 @@
     "message": "Hermes 스킬 동기화됨",
     "description": "Runtime interface message ui.hermes.skills.synced"
   },
+  "runtime_ui_hermes_subagent_status": {
+    "message": "Hermes 하위 에이전트 상태",
+    "description": "Runtime interface message ui.hermes.subagent.status"
+  },
   "runtime_ui_hermes_task_status": {
     "message": "Hermes 작업 상태",
     "description": "Runtime interface message ui.hermes.task.status"
@@ -3410,6 +3414,10 @@
   "runtime_ui_list": {
     "message": "목록",
     "description": "Runtime interface message ui.list"
+  },
+  "runtime_ui_live_subagents": {
+    "message": "실행 중인 하위 에이전트",
+    "description": "Runtime interface message ui.live.subagents"
   },
   "runtime_ui_load_unpacked_installs_update_through_a_guarded_hermes_agent_tu_410111a9": {
     "message": "로드 언팩은 보호된 Hermes 에이전트 차례를 통해 업데이트를 설치한 다음 빌드된 dist/ 폴더를 다시 로드합니다.",
@@ -4834,6 +4842,10 @@
   "runtime_ui_stream": {
     "message": "개울",
     "description": "Runtime interface message ui.stream"
+  },
+  "runtime_ui_subagents": {
+    "message": "하위 에이전트",
+    "description": "Runtime interface message ui.subagents"
   },
   "runtime_ui_submit": {
     "message": "제출하다",
