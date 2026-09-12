@@ -76,6 +76,8 @@ import {
   shouldFallbackToWebSpeechForTranscription,
   shouldOpenVoiceDictationPageForSpeechError,
   shouldUseLocalDashboardAudioTranscription,
+  SPEECH_SILENT_START_TIMEOUT_MS,
+  speechRecognitionSilentlyFailed,
   shouldAutoOpenSessionGroup,
   shouldAutoFlushQueuedTurn,
   shouldCreateFreshSessionOnOpen,
@@ -88,6 +90,7 @@ import {
   resolveBrowserEffectiveModelOptions,
   resolveCatalogModelIdForBinding,
   skillSuggestionsForInput,
+  restSkillsFallbackAllowed,
   updateBrowserModelScope,
   updateBrowserModelOptionScope,
   updateReviewState,
@@ -97,13 +100,16 @@ import {
   agentDiscoveryAppliesToMode,
   agentDiscoveryModeNote,
 } from './lib/common.mjs';
+import { resolveCanonicalBotSession } from './lib/bot-canonical-session.mjs';
 import {
   discoverLocalDashboardBaseUrl,
   extractDashboardSessionToken,
-  fetchRosterFromDashboard,
   readCachedRosterUrl,
   writeCachedRosterUrl,
+  clearCachedRosterUrl,
+  writeLastKnownRoster,
 } from './lib/desktop-roster.mjs';
+import { createBackgroundLoopbackFetch } from './lib/loopback-cors.mjs';
 import {
   fetchPetGallery,
   petFrameIcon,
@@ -114,6 +120,13 @@ import {
 import { blobatar as blobatarSvg } from './lib/vendor/blobatar-2.0.0.js';
 import { renderMarkdownSafe, sanitizeHtml } from './lib/sanitizer.mjs';
 import { highlightCodeBlocks } from './lib/code-highlighting.mjs';
+import { enhanceMarkdownCodeBlocks } from './lib/markdown-code-copy.mjs';
+import {
+  completionRevealPlan,
+  newestAssistantReply,
+  revealSlice,
+  trailingNewMessages,
+} from './lib/completion-reveal.mjs';
 import { getLocale, initI18n, populateLanguageSelect, setLocale, subscribeLocale, t, translateUiText } from './lib/i18n.mjs';
 import {
   buildContextMenuTurn,
@@ -165,7 +178,22 @@ import { createThemeMarketplaceController } from './lib/theme-marketplace-contro
 import { createThemeMarketplaceTransport } from './lib/theme-marketplace-transport.mjs';
 import { buildAgentThemePrompt, extractAgentThemeDocument } from './lib/agent-theme-authoring.mjs';
 import { createImageViewerState, imageViewerReducer } from './lib/image-viewer.mjs';
-import { appendUserImageAttachments, resolvedGeneratedImageSources, resolvedGeneratedImageSourcesFromMessages, resolvedGeneratedImageSourcesFromResult } from './lib/image-render.mjs';
+import { appendUserImageAttachments, extractHistoryMediaAttachments, normalizeUserImageAttachments, preserveUserImageAttachments, resolvedGeneratedImageSources, resolvedGeneratedImageSourcesFromMessages, resolvedGeneratedImageSourcesFromResult } from './lib/image-render.mjs';
+import { classifyMediaKind, resolveMediaFetchPlan } from './lib/media-persistence.mjs';
+import {
+  activeSubagentView,
+  applySubagentEvent,
+  formatSubagentElapsed,
+  isSubagentEventName,
+  pruneFinishedSubagents,
+  reconcileSubagentSnapshot,
+  visibleSubagentView,
+  SUBAGENT_STEER_ICON,
+  SUBAGENT_STOP_ICON,
+  subagentControlPayload,
+  subagentStackSummary,
+  subagentsFromListResult,
+} from './lib/subagent-stack.mjs';
 import { extractYouTubeVideoId } from './lib/transcript.mjs';
 import {
   buildDashboardWsUrl,
@@ -179,6 +207,8 @@ import {
   WS_EVENTS,
   WS_METHODS,
 } from './lib/gateway-ws.mjs';
+import { createDashboardStreamWatchdog, dashboardWatchdogTimeoutAction, isDashboardIdleTimeout, matchesDashboardSessionEvent, shouldReattachDashboardStream } from './lib/dashboard-stream-watchdog.mjs';
+import { clearComposerDraft, loadComposerDraft, persistComposerDraft } from './lib/composer-draft.mjs';
 import {
   BOT_CHAT_TITLE,
   botModeExitStateForRegularSession,
@@ -231,6 +261,7 @@ import {
   buildContextReceipt,
   capabilityStatusRows,
   connectionSecuritySummary,
+  dashboardWsGatewayCapabilities,
   normalizeGatewayCapabilities,
 } from './lib/capabilities.mjs';
 import { filterKnownAssistantReconcileParts, normalizeBrowserRuntimeEvent, reduceAssistantStreamText } from './lib/runtime-events.mjs';
@@ -238,11 +269,14 @@ import { taskStackFromToolEvent, taskStackProgress, updateTaskStackStore } from 
 import {
   DELEGATION_WATCH_STORAGE_KEY,
   createDelegationWatchManager,
+  delegationCompletionMarkerId,
+  delegationCompletionState,
   delegationDispatchFromToolEvent,
   delegationDispatchesFromMessages,
   delegationScopeKey,
   isDelegationCompletionMarkerMessage,
   mergeDelegationWatchStores,
+  normalizeDelegationId,
 } from './lib/async-delegation.mjs';
 import {
   acceptedTurnRecoveryPolicy,
@@ -265,7 +299,11 @@ import {
 } from './lib/agent-discovery.mjs';
 import {
   transcribeAudioViaDashboard,
+  resolveDashboardTranscriptionBaseUrl,
+  dashboardFileStreamUrl,
   dashboardModelDiscoveryBaseUrl,
+  fetchDashboardMediaDataUrl,
+  fetchDashboardSessionToken,
   discoverCanonicalProviderCatalog,
   discoverGatewayVirtualModels,
   discoverModelsFromDashboard,
@@ -290,6 +328,18 @@ import {
   unionCachedModelCatalogs,
   } from './lib/model-discovery.mjs';
 import {
+  VOICE_CAPTURE_SAMPLE_INTERVAL_MS,
+  VOICE_CAPTURE_TIMESLICE_MS,
+  joinDictationTranscript,
+  voiceCaptureDecision,
+  voiceCaptureIsSignal,
+  voiceCapturePeak,
+  voiceCapturePeakFromBytes,
+  voiceDictationCaptureRoute,
+  formatVoiceElapsed,
+  voiceLevelBarHeights,
+} from './lib/voice-capture.mjs';
+import {
   WAKE_MESSAGES,
   WAKE_STORAGE_KEYS,
   normalizeWakeWordSettings,
@@ -303,9 +353,34 @@ import {
 } from './lib/commands.mjs';
 import {
   ELEMENT_PICK_MESSAGES,
+  normalizePickedElement,
   pickedElementForTab,
   storedPickedElementRecord,
 } from './lib/element-picker.mjs';
+import {
+  PAGE_ANNOTATION_MESSAGES,
+  PAGE_ANNOTATION_MODES,
+} from './lib/page-annotation-content.mjs';
+import {
+  addPageAnnotation,
+  buildPageAnnotationComposerBundle,
+  compactPageAnnotationIdentity,
+  emptyPageAnnotationStack,
+  formatPageCommentTargetLabel,
+  mergePageAnnotationComposerState,
+  normalizePageAnnotationResult,
+  pageAnnotationCommentsEnabled,
+  queuePageAnnotationTurn,
+  removePageAnnotation,
+  updatePageAnnotationNote,
+} from './lib/page-annotation.mjs';
+import { captureAnnotationCrop } from './lib/page-annotation-capture.mjs';
+import {
+  clearPageAnnotationSession,
+  createPageAnnotationImageStore,
+  persistPageAnnotationSession,
+  restorePageAnnotationSession,
+} from './lib/page-annotation-storage.mjs';
 import {
   CONTEXT_SCOPE_MODES,
   DEFAULT_CONTEXT_SCOPE,
@@ -318,6 +393,14 @@ import {
   sessionBindingKeyForScope,
   shouldRefreshForTabEvent,
 } from './lib/context-scope.mjs';
+import {
+  createRevisionGate,
+  resetContextScope,
+  resolveContextScopeAction,
+  restoreConversationSessionState,
+  shouldPreserveDashboardTransport,
+  snapshotConversationSessionState,
+} from './lib/context-scope-transition.mjs';
 import {
   CONTEXT_CONSENT_STORAGE_KEY,
   consentGrantedForIdentity,
@@ -472,6 +555,10 @@ hbeBootEmit('panel:body-start');
 const $ = (selector) => document.querySelector(selector);
 const browserApiResolution = resolveBrowserApi();
 const browserApi = browserApiResolution.api;
+const dashboardFetch = createBackgroundLoopbackFetch({
+  sendMessage: (message) => browserApi.runtime.sendMessage(message),
+  fetchFn: globalThis.fetch?.bind(globalThis),
+});
 const browserProduct = detectBrowserProduct({
   userAgent: navigator.userAgent,
   brands: navigator.userAgentData?.brands || [],
@@ -519,6 +606,11 @@ const els = {
   taskStackSummary: $('#taskStackSummary'),
   taskStackProgress: $('#taskStackProgress'),
   taskStackList: $('#taskStackList'),
+  subagentStack: $('#subagentStack'),
+  subagentStackToggle: $('#subagentStackToggle'),
+  subagentStackSummary: $('#subagentStackSummary'),
+  subagentStackList: $('#subagentStackList'),
+  subagentStackDetail: $('#subagentStackDetail'),
   composer: $('#composer'),
   composerLabel: $('#composerLabel'),
   input: $('#promptInput'),
@@ -559,6 +651,10 @@ const els = {
   retryRunStatusButton: $('#retryRunStatusButton'),
   discardHeldQueueButton: $('#discardHeldQueueButton'),
   sendButton: $('#sendButton'),
+  pageCommentTrayButton: $('#pageCommentTrayButton'),
+  pageCommentTray: $('#pageCommentTray'),
+  pageCommentTrayList: $('#pageCommentTrayList'),
+  pageCommentTraySend: $('#pageCommentTraySend'),
   botModeThreadsButton: $('#botModeThreadsButton'),
   botModeNewThreadButton: $('#botModeNewThreadButton'),
   inlineSendButton: $('#inlineSendButton'),
@@ -567,6 +663,10 @@ const els = {
   stopButton: $('#stopButton'),
   wakeButton: $('#wakeButton'),
   voiceButton: $('#voiceButton'),
+  voiceActivity: $('#voiceActivity'),
+  voiceActivityLabel: $('#voiceActivityLabel'),
+  voiceActivityTimer: $('#voiceActivityTimer'),
+  voiceActivityBars: $('#voiceActivityBars'),
   refreshButton: $('#refreshButton'),
   settingsButton: $('#settingsButton'),
   botModeButton: $('#botModeButton'),
@@ -660,6 +760,7 @@ const els = {
   botModePetApply: $('#botModePetApply'),
   botModePetClear: $('#botModePetClear'),
   botModePetHint: $('#botModePetHint'),
+  startupActions: $('#startupActions'),
   startupTestConnectionButton: $('#startupTestConnectionButton'),
   openFullViewButton: $('#openFullViewButton'),
   closeSettingsButton: $('#closeSettingsButton'),
@@ -722,6 +823,21 @@ const els = {
   attachMenuButton: $('#attachMenuButton'),
   attachMenu: $('#attachMenu'),
   attachmentList: $('#attachmentList'),
+  pageAnnotationPanel: $('#pageAnnotationPanel'),
+  pageAnnotationElementButton: $('#pageAnnotationElementButton'),
+  pageAnnotationAreaButton: $('#pageAnnotationAreaButton'),
+  pageAnnotationCancelButton: $('#pageAnnotationCancelButton'),
+  pageAnnotationStatus: $('#pageAnnotationStatus'),
+  pageAnnotationDraft: $('#pageAnnotationDraft'),
+  pageAnnotationDraftLabel: $('#pageAnnotationDraftLabel'),
+  pageAnnotationNote: $('#pageAnnotationNote'),
+  pageAnnotationSaveButton: $('#pageAnnotationSaveButton'),
+  pageAnnotationDiscardButton: $('#pageAnnotationDiscardButton'),
+  pageAnnotationList: $('#pageAnnotationList'),
+  pageAnnotationFlushButton: $('#pageAnnotationFlushButton'),
+  pageAnnotationQueueButton: $('#pageAnnotationQueueButton'),
+  pageAnnotationClearButton: $('#pageAnnotationClearButton'),
+  pageAnnotationDoneButton: $('#pageAnnotationDoneButton'),
   fileInput: $('#fileInput'),
   imageInput: $('#imageInput'),
   folderInput: $('#folderInput'),
@@ -858,15 +974,34 @@ let startupReadiness = initialStartupReadiness(settings);
 let contextScope = normalizeContextScope(DEFAULT_CONTEXT_SCOPE);
 let previousConversationScope = normalizeContextScope(DEFAULT_CONTEXT_SCOPE);
 let currentContext = { activeTab: null, tabs: [], pageContext: null, contextScope };
+let nonPinnedConversationSessionSnapshot = null;
+const scopeRevision = createRevisionGate();
+const contextRefreshRevision = createRevisionGate();
+let scopeTransitionQueue = Promise.resolve();
 let contextConsentPrincipalBinding = { origin: '', transport: '', principal: '' };
 const pickedElementsByTabId = new Map();
 let elementPickInProgress = false;
 let elementPickState = null;
 const PICK_STATE_STORAGE_NAME = 'hermes:elementPickInProgress';
+let pageAnnotationSession = null;
+let pageAnnotationStack = emptyPageAnnotationStack();
+let pageAnnotationDraft = null;
+let pageAnnotationMode = PAGE_ANNOTATION_MODES.ELEMENT;
+let pageAnnotationStale = false;
+let pageCommentPickActive = false;
+const pageAnnotationImages = createPageAnnotationImageStore();
 let selectedTabs = []; // null = all tabs; array of SafeTab = user-filtered set
 let messages = [];
 let taskStackStore = {};
 let taskStackExpanded = true;
+let subagentState = {};
+let subagentExpanded = true;
+let subagentSelectedId = '';
+let subagentSteerDraft = '';
+let subagentControlBusy = false;
+let subagentControlError = '';
+let subagentTimer = null;
+const subagentBoundClients = new WeakSet();
 let loadedSessionContextEstimate = { sessionId: '', contextTokens: 0, visibleTokens: 0 };
 let availableModels = [];
 let availableSessions = [];
@@ -874,6 +1009,7 @@ let availableSkills = [];
 let availableProfiles = [];
 let botModeRoster = [];
 let botModeRosterGeneration = 0;
+let rosterRetryCount = 0;
 // Group chats are kept in their own roster, separated from agent profiles.
 // Synced rows (dashboard / gateway) remain in memory for the current Bot Mode
 // lifecycle. Browser never persists or fabricates group-room state.
@@ -885,8 +1021,6 @@ let botModeView = 'agents';
 let botModeRosterNote = '';
 let profileWsConnection = null;
 let desktopDashboardDiscoveryPromise = null;
-let profileRichRosterPromise = null;
-let profileRichRosterAllowsTrust = false;
 let activeConversationTransport = 'rest';
 let activeDashboardWsConnection = null;
 let activeGroupProjection = null;
@@ -927,12 +1061,16 @@ let activeRunId = '';
 let activeRunControl = null;
 let runControlGeneration = 0;
 let pendingSteerText = '';
+let completionSettlePending = false;
 let dragDepth = 0;
 let speechRecognition = null;
+let speechWatchdogTimer = null;
 let voiceRecorder = null;
 let voiceRecorderStream = null;
 let voiceRecorderChunks = [];
+let voiceCaptureSession = null;
 let dictating = false;
+let transcribingVoice = false;
 let voiceTransitionInFlight = false;
 let voiceDictationPageOpenPromise = null;
 let dictationBaseText = '';
@@ -1017,6 +1155,252 @@ function renderTaskStack() {
   els.taskStackList.replaceChildren(...rows);
 }
 
+function currentSubagentSessionKeys() {
+  return [...new Set([
+    settings.sessionId,
+    remoteWsConnection?.wsSessionId,
+    remoteWsConnection?.wsStoredSessionId,
+    activeDashboardWsConnection?.wsSessionId,
+    activeDashboardWsConnection?.wsStoredSessionId,
+  ].map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function currentSubagentSessionKey() {
+  return currentSubagentSessionKeys()[0] || '';
+}
+
+function currentSubagentItems() {
+  const keys = currentSubagentSessionKeys();
+  for (const key of keys) {
+    if (Array.isArray(subagentState[key]) && subagentState[key].length) return subagentState[key];
+  }
+  return [];
+}
+
+function ensureSubagentTimer(liveCount) {
+  if (liveCount && !subagentTimer) {
+    subagentTimer = setInterval(() => renderSubagentStack(), 1000);
+  } else if (!liveCount && subagentTimer) {
+    clearInterval(subagentTimer);
+    subagentTimer = null;
+  }
+}
+
+function ingestSubagentGatewayEvent(event) {
+  const type = String(event?.type || event?.name || '').trim();
+  const keys = currentSubagentSessionKeys();
+  const eventSession = String(
+    event?.sessionId
+    || event?.session_id
+    || event?.payload?.parent_session_id
+    || event?.payload?.session_id
+    || '',
+  ).trim();
+  if (type === 'message.start' && (eventSession || keys[0])) {
+    subagentState = pruneFinishedSubagents(subagentState, eventSession || keys[0]);
+    renderSubagentStack();
+    return;
+  }
+  if (!isSubagentEventName(type)) return;
+  if (eventSession && keys.length && !keys.includes(eventSession)) return;
+  const key = eventSession || keys[0] || '';
+  if (!key) return;
+  const beforeLive = activeSubagentView(currentSubagentItems()).length;
+  subagentState = applySubagentEvent(subagentState, key, event);
+  if (keys[0] && keys[0] !== key) {
+    subagentState = applySubagentEvent(subagentState, keys[0], event);
+  }
+  const payload = event.payload && typeof event.payload === 'object' ? event.payload : {};
+  const delegationId = normalizeDelegationId(payload.delegation_id || payload.delegationId);
+  if (delegationId) startDelegationWatch({ delegationId }).catch(() => {});
+  renderSubagentStack();
+  const afterLive = activeSubagentView(currentSubagentItems()).length;
+  if (beforeLive > 0 && afterLive === 0) {
+    void refreshSessionAfterSubagentsSettle();
+  }
+}
+
+function bindSubagentClient(client) {
+  if (!client?.on || subagentBoundClients.has(client)) return;
+  subagentBoundClients.add(client);
+  client.on('*', (event) => ingestSubagentGatewayEvent(event));
+}
+
+async function hydrateSubagentSnapshot(client, sessionId = '') {
+  const sid = String(sessionId || currentSubagentSessionKey() || '').trim();
+  if (!client?.request || !sid) return;
+  try {
+    const result = await client.request(WS_METHODS.subagentList, { session_id: sid });
+    subagentState = reconcileSubagentSnapshot(subagentState, sid, subagentsFromListResult(result));
+    renderSubagentStack();
+  } catch {
+    // Older gateways omit subagent.list. Live events still populate the stack.
+  }
+}
+
+async function runSelectedSubagentControl(action, text = '') {
+  const connection = await ensureActiveDashboardWsConnection().catch(() => null);
+  if (!connection?.client) return;
+  if (action === 'steer' && !String(text || '').trim()) return;
+  subagentControlBusy = true;
+  subagentControlError = '';
+  renderSubagentStack();
+  try {
+    // Steering authority requires an ATTACHED live runtime. The session-scoped
+    // subagent.* RPCs fail with 4001 "session not found" when the stored id has
+    // been reaped, so resume the durable session first to mint a fresh live id.
+    const durableSessionId = String(settings.sessionId || '').trim();
+    const { liveId } = await establishGatewaySession({
+      client: connection.client,
+      storedSessionId: durableSessionId,
+      profile: safeActiveProfile(),
+    });
+    connection.wsSessionId = liveId;
+    connection.wsStoredSessionId = durableSessionId;
+    connection.profile = safeActiveProfile();
+    const payload = subagentControlPayload(action, {
+      sessionId: liveId,
+      subagentId: subagentSelectedId,
+      text,
+    });
+    if (!payload.session_id || !payload.subagent_id) return;
+    const method = action === 'steer' ? WS_METHODS.subagentSteer : WS_METHODS.subagentInterrupt;
+    const result = await connection.client.request(method, payload);
+    if (action === 'interrupt' && result && result.found === false) {
+      throw new Error('Subagent is no longer running.');
+    }
+    if (action === 'steer') subagentSteerDraft = '';
+  } catch (error) {
+    subagentControlError = String(error?.message || error || 'Subagent control failed');
+  } finally {
+    subagentControlBusy = false;
+    renderSubagentStack();
+  }
+}
+
+function renderSubagentStack() {
+  if (!els.subagentStack) return;
+  const items = currentSubagentItems();
+  const live = activeSubagentView(items);
+  const visible = live;
+  ensureSubagentTimer(live.length);
+  els.subagentStack.hidden = !visible.length;
+  if (!visible.length) {
+    els.subagentStackList.replaceChildren();
+    if (els.subagentStackDetail) {
+      els.subagentStackDetail.hidden = true;
+      els.subagentStackDetail.replaceChildren();
+    }
+    subagentSelectedId = '';
+    return;
+  }
+  if (subagentSelectedId && !visible.some((item) => item.id === subagentSelectedId)) subagentSelectedId = '';
+  els.subagentStack.dataset.expanded = String(subagentExpanded);
+  els.subagentStackToggle?.setAttribute('aria-expanded', String(subagentExpanded));
+  if (els.subagentStackSummary) els.subagentStackSummary.textContent = subagentStackSummary(items);
+  const listScrollTop = els.subagentStackList.scrollTop;
+  const oldStream = els.subagentStackDetail?.querySelector('.subagent-stack-stream');
+  const streamScrollTop = oldStream?.scrollTop || 0;
+  const streamScrollLeft = oldStream?.scrollLeft || 0;
+  const keepFocus = document.activeElement?.id === 'subagentSteerInput';
+  const rows = visible.map((item) => {
+    const row = document.createElement('li');
+    row.className = `task-stack-item subagent-stack-item ${item.status}`;
+    row.dataset.subagentId = item.id;
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', String(item.id === subagentSelectedId));
+    const pulse = document.createElement('span');
+    pulse.className = 'subagent-stack-pulse';
+    pulse.setAttribute('aria-hidden', 'true');
+    const copy = document.createElement('span');
+    copy.className = 'subagent-stack-copy';
+    const goal = document.createElement('strong');
+    goal.textContent = item.goal;
+    goal.title = item.goal;
+    const tool = document.createElement('span');
+    const modelBit = String(item.model || '').split('/').pop();
+    tool.textContent = item.summary || item.currentTool || modelBit || item.status;
+    copy.append(goal, tool);
+    const meta = document.createElement('span');
+    meta.className = 'subagent-stack-meta';
+    meta.textContent = `${item.status} · ${formatSubagentElapsed(item.startedAt)}`;
+    row.append(pulse, copy, meta);
+    row.addEventListener('click', () => {
+      subagentSelectedId = subagentSelectedId === item.id ? '' : item.id;
+      subagentControlError = '';
+      renderSubagentStack();
+    });
+    return row;
+  });
+  els.subagentStackList.replaceChildren(...rows);
+  els.subagentStackList.scrollTop = listScrollTop;
+  const selected = visible.find((item) => item.id === subagentSelectedId);
+  if (!els.subagentStackDetail) return;
+  if (!selected || !subagentExpanded) {
+    els.subagentStackDetail.hidden = true;
+    els.subagentStackDetail.replaceChildren();
+    return;
+  }
+  els.subagentStackDetail.hidden = false;
+  const stream = document.createElement('ol');
+  stream.className = 'subagent-stack-stream';
+  for (const entry of selected.stream || []) {
+    const line = document.createElement('li');
+    if (entry.isError) line.className = 'is-error';
+    line.textContent = entry.text || '';
+    stream.append(line);
+  }
+  const controls = document.createElement('div');
+  controls.className = 'subagent-stack-controls';
+  const input = document.createElement('input');
+  input.id = 'subagentSteerInput';
+  input.type = 'text';
+  input.autocomplete = 'off';
+  input.placeholder = selected.acceptingSteer === false || selected.status !== 'running' ? 'Not accepting steer' : 'Steer this subagent';
+  input.value = subagentSteerDraft;
+  input.disabled = subagentControlBusy || selected.acceptingSteer === false || selected.status !== 'running';
+  input.addEventListener('input', () => {
+    subagentSteerDraft = input.value;
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void runSelectedSubagentControl('steer', subagentSteerDraft);
+    }
+  });
+  const steerButton = document.createElement('button');
+  steerButton.type = 'button';
+  steerButton.className = 'subagent-stack-icon';
+  steerButton.title = 'Steer this subagent';
+  steerButton.setAttribute('aria-label', 'Steer this subagent');
+  steerButton.innerHTML = SUBAGENT_STEER_ICON;
+  steerButton.disabled = subagentControlBusy || selected.acceptingSteer === false || selected.status !== 'running';
+  steerButton.addEventListener('click', () => {
+    void runSelectedSubagentControl('steer', subagentSteerDraft);
+  });
+  const stopButton = document.createElement('button');
+  stopButton.type = 'button';
+  stopButton.className = 'subagent-stack-icon';
+  stopButton.title = 'Stop this subagent';
+  stopButton.setAttribute('aria-label', 'Stop this subagent');
+  stopButton.textContent = SUBAGENT_STOP_ICON;
+  stopButton.disabled = subagentControlBusy || selected.status !== 'running';
+  stopButton.addEventListener('click', () => {
+    void runSelectedSubagentControl('interrupt');
+  });
+  controls.append(input, steerButton, stopButton);
+  els.subagentStackDetail.replaceChildren(stream, controls);
+  if (subagentControlError) {
+    const error = document.createElement('p');
+    error.className = 'subagent-stack-error';
+    error.textContent = subagentControlError;
+    els.subagentStackDetail.append(error);
+  }
+  if (keepFocus) input.focus({ preventScroll: true });
+  stream.scrollTop = streamScrollTop;
+  stream.scrollLeft = streamScrollLeft;
+}
+
 async function captureTaskToolEvent(event, targetSessionId = '') {
   await captureDelegationToolEvent(event);
   const tasks = taskStackFromToolEvent(event);
@@ -1066,12 +1450,13 @@ const delegationWatchManager = createDelegationWatchManager({
   isBusy: () => sending,
   isActive: (watch) => watch.scopeKey === currentDelegationScopeKey()
     && watch.durableSessionId === String(settings.sessionId || '').trim(),
-  loadHistory: async (watch) => fetchSessionMessagesQuietly(
-    watch.transport === 'dashboard-ws' ? watch.liveSessionId : watch.durableSessionId,
-    { transport: watch.transport },
+  loadHistory: async (watch) => (
+    watch.transport === 'dashboard-ws'
+      ? fetchDashboardHistoryWithResume(watch.durableSessionId)
+      : fetchSessionMessagesQuietly(watch.durableSessionId, { transport: 'rest' })
   ),
   onComplete: async (watch, result) => {
-    await commitFetchedSessionMessages(result, {
+    await commitFetchedSessionMessagesWithReveal(result, {
       sessionId: watch.durableSessionId,
       requestId: sessionLoadRequestId,
     });
@@ -1094,10 +1479,70 @@ async function startDelegationWatch(dispatch) {
   return delegationWatchManager.start({
     scopeKey: currentDelegationScopeKey(),
     durableSessionId,
-    liveSessionId: remoteWsConnection?.wsSessionId || '',
+    liveSessionId: String(
+      remoteWsConnection?.wsSessionId
+      || activeDashboardWsConnection?.wsSessionId
+      || '',
+    ).trim(),
     delegationId: dispatch.delegationId,
-    transport: isRemoteWsMode() ? 'dashboard-ws' : 'rest',
+    transport: usesDashboardWsChatTransport() ? 'dashboard-ws' : 'rest',
   });
+}
+
+function latestDelegationCompletionId(rows = []) {
+  const list = Array.isArray(rows) ? rows : [];
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const id = delegationCompletionMarkerId(list[index]);
+    if (id) return id;
+  }
+  return '';
+}
+
+async function refreshSessionAfterSubagentsSettle() {
+  const durableSessionId = String(settings.sessionId || '').trim();
+  if (!durableSessionId) return;
+  // The gateway generates the parent completion turn AFTER the children finish,
+  // so the first fetch races it. The runtime may also have reaped the stale live
+  // id ("not in memory") — fetchDashboardHistoryWithResume resumes the durable
+  // session first. Keep polling until a NEW completion marker AND its parent
+  // reply are both visible in durable history.
+  const dashboard = usesDashboardWsChatTransport();
+  const baselineCompletionId = latestDelegationCompletionId(messages);
+  completionSettlePending = true;
+  renderCompletionPendingRow();
+  try {
+    await activateCurrentDelegationSession();
+    const waitMs = [0, 2_000, 5_000, 10_000, 20_000, 30_000];
+    for (let attempt = 0; attempt < waitMs.length; attempt += 1) {
+      if (waitMs[attempt]) await new Promise((resolve) => setTimeout(resolve, waitMs[attempt]));
+      if (String(settings.sessionId || '').trim() !== durableSessionId) return;
+      let result;
+      try {
+        result = dashboard
+          ? await fetchDashboardHistoryWithResume(durableSessionId)
+          : await fetchSessionMessagesQuietly(durableSessionId, { transport: 'rest' });
+        await commitFetchedSessionMessagesWithReveal(result, {
+          sessionId: durableSessionId,
+          requestId: sessionLoadRequestId,
+        });
+      } catch {
+        // History may lag a beat after the last child completes.
+        continue;
+      }
+      const rows = Array.isArray(result?.messages) ? result.messages : [];
+      const completionId = latestDelegationCompletionId(rows);
+      if (completionId && completionId !== baselineCompletionId
+        && delegationCompletionState(rows, completionId).state === 'completed') {
+        // The batch summary is in the transcript; reconcile any roster rows the
+        // live events missed so nothing keeps ticking after the reply is visible.
+        void hydrateSubagentSnapshot(activeDashboardWsConnection?.client, durableSessionId);
+        return;
+      }
+    }
+  } finally {
+    completionSettlePending = false;
+    renderCompletionPendingRow();
+  }
 }
 
 async function captureDelegationToolEvent(event) {
@@ -1131,7 +1576,7 @@ async function activateCurrentDelegationSession() {
   await delegationWatchManager.activate({
     scopeKey: currentDelegationScopeKey(),
     durableSessionId,
-    liveSessionId: remoteWsConnection?.wsSessionId || '',
+    liveSessionId: remoteWsConnection?.wsSessionId || activeDashboardWsConnection?.wsSessionId || '',
   });
 }
 
@@ -1241,19 +1686,22 @@ function minimumConnectionReady() {
 }
 
 function positionStartupSettings(active = document.body?.classList.contains('startup-active')) {
-  const topbar = els.settingsButton?.closest('.topbar');
-  if (!topbar) return;
-  if (!active) {
-    topbar.style.removeProperty('--startup-settings-top');
+  const topbar = els.settingsButton?.closest('.topbar') || document.querySelector('.topbar');
+  const actions = els.startupActions || document.getElementById('startupActions');
+  const status = topbar?.querySelector('.topbar-status');
+  const buttons = [els.settingsButton, els.startupTestConnectionButton, els.startupConnectButton].filter(Boolean);
+  topbar?.style.removeProperty('--startup-settings-top');
+  if (!topbar || !actions) return;
+  if (active) {
+    actions.hidden = false;
+    for (const button of buttons) actions.append(button);
     return;
   }
-  const listRect = els.startupStepList?.getBoundingClientRect();
-  const buttonHeight = Math.max(34, els.settingsButton?.getBoundingClientRect().height || 0);
-  if (!listRect || !Number.isFinite(listRect.bottom)) return;
-  const viewportHeight = Math.max(buttonHeight + 24, Number(globalThis.innerHeight) || 0);
-  const maxTop = Math.max(12, viewportHeight - buttonHeight - 12);
-  const top = Math.min(maxTop, Math.round(listRect.bottom + 12));
-  topbar.style.setProperty('--startup-settings-top', `${top}px`);
+  actions.hidden = true;
+  for (const button of buttons) {
+    if (status) topbar.insertBefore(button, status);
+    else topbar.append(button);
+  }
 }
 
 // The Bot Mode deck and profile sheet pin their top edge to the topbar's real
@@ -2087,6 +2535,64 @@ function ensureSidepanelInstanceId() {
   }
 }
 
+let composerDraftSaveTimer = 0;
+let restoringComposerDraft = false;
+
+function composerDraftStorage() {
+  return globalThis.sessionStorage || null;
+}
+
+function persistCurrentComposerDraft({ immediate = false } = {}) {
+  if (restoringComposerDraft) return;
+  const run = () => {
+    composerDraftSaveTimer = 0;
+    persistComposerDraft(composerDraftStorage(), {
+      instanceId: ensureSidepanelInstanceId(),
+      text: els.input?.value || '',
+      attachments,
+    });
+  };
+  if (immediate) {
+    if (composerDraftSaveTimer) {
+      clearTimeout(composerDraftSaveTimer);
+      composerDraftSaveTimer = 0;
+    }
+    run();
+    return;
+  }
+  if (composerDraftSaveTimer) return;
+  composerDraftSaveTimer = setTimeout(run, 200);
+}
+
+function forgetComposerDraft() {
+  if (composerDraftSaveTimer) {
+    clearTimeout(composerDraftSaveTimer);
+    composerDraftSaveTimer = 0;
+  }
+  clearComposerDraft(composerDraftStorage(), { instanceId: ensureSidepanelInstanceId() });
+}
+
+function restoreComposerDraft() {
+  const draft = loadComposerDraft(composerDraftStorage(), { instanceId: ensureSidepanelInstanceId() });
+  if (!draft) return false;
+  restoringComposerDraft = true;
+  try {
+    if (els.input && !String(els.input.value || '').trim() && draft.text) {
+      els.input.value = draft.text;
+    }
+    if (!attachments.length && draft.attachments.length) {
+      attachments = draft.attachments;
+      renderAttachments();
+    } else {
+      renderContextWindow();
+      updateComposerBusyState();
+    }
+    return true;
+  } finally {
+    restoringComposerDraft = false;
+  }
+}
+
 function fullViewHandoffUrl() {
   const sourceSurfaceId = createSurfaceId({
     kind: SURFACE_KINDS.SIDE_PANEL,
@@ -2151,6 +2657,51 @@ function rememberConversationScope(scope = contextScope) {
   previousConversationScope = conversationScopeForContextScope(scope, previousConversationScope);
   saveConversationScopeForInstance();
   return previousConversationScope;
+}
+
+function nonPinnedConversationSessionKey() {
+  return `hermesBrowserConversationSession:${ensureSidepanelInstanceId()}`;
+}
+
+function rememberNonPinnedConversationSession(scope = previousConversationScope) {
+  const conversationScope = conversationScopeForContextScope(scope, previousConversationScope);
+  if (conversationScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB) return null;
+  const snapshot = snapshotConversationSessionState({
+    settings,
+    activeSessionRuntime,
+    sessionRoutesAvailable,
+    transport: activeConversationTransport,
+  });
+  nonPinnedConversationSessionSnapshot = snapshot;
+  try {
+    globalThis.sessionStorage?.setItem(nonPinnedConversationSessionKey(), JSON.stringify(snapshot));
+  } catch {
+    // Per-panel session identity persistence is best-effort only.
+  }
+  return snapshot;
+}
+
+function loadNonPinnedConversationSession() {
+  if (nonPinnedConversationSessionSnapshot) return nonPinnedConversationSessionSnapshot;
+  try {
+    const stored = globalThis.sessionStorage?.getItem(nonPinnedConversationSessionKey());
+    if (stored) nonPinnedConversationSessionSnapshot = JSON.parse(stored);
+  } catch {
+    nonPinnedConversationSessionSnapshot = null;
+  }
+  return nonPinnedConversationSessionSnapshot;
+}
+
+function restoreNonPinnedConversationSession() {
+  const snapshot = loadNonPinnedConversationSession();
+  if (!snapshot) return null;
+  const restored = restoreConversationSessionState(settings, snapshot);
+  if (!restored.restored) return null;
+  settings = restored.settings;
+  activeSessionRuntime = restored.activeSessionRuntime;
+  sessionRoutesAvailable = restored.sessionRoutesAvailable;
+  activeConversationTransport = restored.transport;
+  return restored;
 }
 
 function isGlobalPanelResidency() {
@@ -2219,9 +2770,11 @@ function activeMessagesStorageKey(conversationScope = previousConversationScope)
     : 'hermesBrowserMessages';
 }
 
-async function loadMessagesForActiveScope() {
+async function loadMessagesForActiveScope({ scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   const key = activeMessagesStorageKey(previousConversationScope);
   const stored = await browserApi.storage.local.get([key]);
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   messages = Array.isArray(stored[key]) ? stored[key] : [];
   const visibleTokens = estimateLocalSessionContextTokens({ messages: browserDisplayMessages(messages) });
   loadedSessionContextEstimate = {
@@ -2230,23 +2783,29 @@ async function loadMessagesForActiveScope() {
     visibleTokens,
   };
   renderMessagesFromStorage();
+  return true;
 }
 
-async function saveMessagesForActiveScope() {
+async function saveMessagesForActiveScope({ scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   const key = activeMessagesStorageKey(previousConversationScope);
   const cachedMessages = messagesForLocalCache(messages, settings.maxLocalMessages);
   await browserApi.storage.local.set({ [key]: cachedMessages });
+  return scopeRevision.isCurrent(scopeRevisionId);
 }
 
-async function loadSessionBindingForActiveScope() {
+async function loadSessionBindingForActiveScope({ scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return null;
   if (previousConversationScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB) return null;
   const key = sessionBindingKeyForScope(contextScope, previousConversationScope);
   const stored = await browserApi.storage.local.get([key]);
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return null;
   return stored[key] || null;
 }
 
-async function saveSessionBindingForActiveScope(session) {
-  if (previousConversationScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB || !session?.id) return;
+async function saveSessionBindingForActiveScope(session, { scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+  if (previousConversationScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB || !session?.id) return false;
   const key = sessionBindingKeyForScope(contextScope, previousConversationScope);
   // Bind the stored session to the gateway + profile that created it so resume
   // cannot silently cross profile boundaries if the user switches profiles.
@@ -2255,16 +2814,16 @@ async function saveSessionBindingForActiveScope(session) {
     gatewayMode: settings.gatewayMode,
     profile: safeActiveProfile(),
   });
-  await browserApi.storage.local.set({
-    [key]: withSessionBindingIdentity({
-      sessionId: session.id,
-      sessionTitle: session.title || session.id,
-      pinnedTabId: previousConversationScope.pinnedTabId,
-      pinnedTitle: previousConversationScope.pinnedTitle || '',
-      pinnedUrl: previousConversationScope.pinnedUrl || '',
-      updatedAt: Date.now(),
-    }, identity),
-  });
+  const binding = withSessionBindingIdentity({
+    sessionId: session.id,
+    sessionTitle: session.title || session.id,
+    pinnedTabId: previousConversationScope.pinnedTabId,
+    pinnedTitle: previousConversationScope.pinnedTitle || '',
+    pinnedUrl: previousConversationScope.pinnedUrl || '',
+    updatedAt: Date.now(),
+  }, identity);
+  await browserApi.storage.local.set({ [key]: binding });
+  return scopeRevision.isCurrent(scopeRevisionId);
 }
 
 function syncSelectedTabsFromContextScope(tabs = currentContext.tabs || []) {
@@ -2428,7 +2987,11 @@ function renderContextScopeTabList(query = '') {
     row.className = 'context-scope-tab-row';
     appendContextScopeMenuButton({
       action: `pin-tab:${tab.id}`,
-      label: t('context.pin_tab', { title: compactPinnedTitle(tab.title || tab.url || translateUiText('Untitled tab'), 88) }),
+      label: isPinned
+        ? isAttachedPanelResidency()
+          ? t('context.return_attached_tab')
+          : t('context.follow_active_tab')
+        : t('context.pin_tab', { title: compactPinnedTitle(tab.title || tab.url || translateUiText('Untitled tab'), 88) }),
       detail: translateUiText(isPinned ? 'current' : isActive ? 'active' : ''),
       selected: isPinned,
       parent: row,
@@ -2537,6 +3100,24 @@ function renderContextScopeMenu(query = '', { focusSearch = false } = {}) {
     });
   } else if (contextScope.mode === CONTEXT_SCOPE_MODES.FOLLOW_ACTIVE) {
     syncAttachedPanelContextScope();
+    appendContextScopeMenuButton({
+      action: 'attached-reset',
+      label: t('context.return_attached_tab'),
+      detail: translateUiText('owner'),
+      title: translateUiText('Return Hermes context to the tab that owns this attached panel.'),
+      selected: true,
+      parent: actions,
+    });
+  } else {
+    appendContextScopeMenuButton({
+      action: 'attached-reset',
+      label: t('context.return_attached_tab'),
+      detail: translateUiText('owner'),
+      title: translateUiText('Return Hermes context to the tab that owns this attached panel.'),
+      selected: contextScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB
+        && Number(contextScope.pinnedTabId) === Number(sidePanelParams.tabId),
+      parent: actions,
+    });
   }
   appendContextScopeMenuButton({
     action: 'pin-active',
@@ -2596,13 +3177,14 @@ function makePinnedTabSessionTitle(tab = {}) {
 // Used for explicit scope changes inside an already-open panel. Startup uses
 // initializeSessionForPanelOpen() so opening the extension does not silently
 // resume a previous Browser session.
-async function ensureSessionForActiveScope({ focus = false } = {}) {
+async function ensureSessionForActiveScope({ focus = false, scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   if (previousConversationScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB) {
-    await ensureDefaultBrowserSession({ focus });
-    return;
+    return ensureDefaultBrowserSession({ focus, scopeRevisionId });
   }
-  if (!minimumConnectionReady()) return;
-  const binding = await loadSessionBindingForActiveScope();
+  if (!minimumConnectionReady()) return false;
+  const binding = await loadSessionBindingForActiveScope({ scopeRevisionId });
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   // Never resume a stored session under a different gateway + profile than the
   // one that created it. A mismatched binding is stale; drop it and start fresh
   // so the user's Chat-only history never silently crosses into another profile.
@@ -2618,16 +3200,20 @@ async function ensureSessionForActiveScope({ focus = false } = {}) {
         title: binding.sessionTitle || binding.sessionId,
         source: DEFAULT_SETTINGS.sessionSource,
       };
-      await openHermesSession(session);
-      return;
+      return openHermesSession(session, { scopeRevisionId });
     }
     // Mismatched profile/gateway: forget the binding so we don't resume the
     // wrong profile's chat. The stored messages for this scope stay until the
     // new session overwrites them.
     const key = sessionBindingKeyForScope(contextScope, previousConversationScope);
     await browserApi.storage.local.remove([key]);
+    if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   }
-  await beginHermesBrowserDraft({ title: makePinnedTabSessionTitle(currentContext.activeTab || previousConversationScope), focus });
+  return beginHermesBrowserDraft({
+    title: makePinnedTabSessionTitle(currentContext.activeTab || previousConversationScope),
+    focus,
+    scopeRevisionId,
+  });
 }
 
 async function initializeSessionForPanelOpen({ focus = false } = {}) {
@@ -2640,50 +3226,185 @@ async function initializeSessionForPanelOpen({ focus = false } = {}) {
   await ensureSessionForActiveScope({ focus });
 }
 
-async function applyContextScope(nextScope, { ensureSession = false } = {}) {
-  contextScope = normalizeContextScope(nextScope);
+function scopeTransitionSnapshot() {
+  return {
+    contextScope,
+    previousConversationScope,
+    selectedTabs: selectedTabs === null ? null : [...selectedTabs],
+    currentContext,
+    messages,
+    settings,
+    availableSessions,
+    activeSessionRuntime,
+    activeConversationTransport,
+    activeDashboardWsConnection,
+    activeDashboardWsConnectionState: activeDashboardWsConnection
+      ? {
+        wsSessionId: activeDashboardWsConnection.wsSessionId,
+        wsStoredSessionId: activeDashboardWsConnection.wsStoredSessionId,
+        profile: activeDashboardWsConnection.profile,
+      }
+      : null,
+    sessionRoutesAvailable,
+    loadedSessionContextEstimate,
+  };
+}
+
+function restoreScopeTransitionSnapshot(snapshot) {
+  contextScope = snapshot.contextScope;
+  previousConversationScope = snapshot.previousConversationScope;
+  selectedTabs = snapshot.selectedTabs === null ? null : [...snapshot.selectedTabs];
+  currentContext = snapshot.currentContext;
+  messages = snapshot.messages;
+  settings = snapshot.settings;
+  availableSessions = snapshot.availableSessions;
+  activeSessionRuntime = snapshot.activeSessionRuntime;
+  activeConversationTransport = snapshot.activeConversationTransport;
+  activeDashboardWsConnection = snapshot.activeDashboardWsConnection;
+  if (activeDashboardWsConnection && snapshot.activeDashboardWsConnectionState) {
+    activeDashboardWsConnection.wsSessionId = snapshot.activeDashboardWsConnectionState.wsSessionId;
+    activeDashboardWsConnection.wsStoredSessionId = snapshot.activeDashboardWsConnectionState.wsStoredSessionId;
+    activeDashboardWsConnection.profile = snapshot.activeDashboardWsConnectionState.profile;
+  }
+  sessionRoutesAvailable = snapshot.sessionRoutesAvailable;
+  loadedSessionContextEstimate = snapshot.loadedSessionContextEstimate;
+  saveContextScopeForInstance();
+  saveConversationScopeForInstance();
+  renderContextScopeControls();
+  renderMessagesFromStorage();
+  updateSessionLabel();
+  renderSessionMenu();
+}
+
+async function commitContextScope(nextScope, { ensureSession = false, scopeRevisionId } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+  const snapshot = ensureSession ? scopeTransitionSnapshot() : null;
+  const normalizedScope = normalizeContextScope(nextScope);
+  const conversationScope = conversationScopeForContextScope(contextScope, previousConversationScope);
+  const enteringExplicitPin = ensureSession
+    && conversationScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB
+    && normalizedScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB;
+  const returningToGlobalFollow = ensureSession
+    && conversationScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB
+    && normalizedScope.mode === CONTEXT_SCOPE_MODES.FOLLOW_ACTIVE;
+  if (enteringExplicitPin) rememberNonPinnedConversationSession(conversationScope);
+  const restoredConversation = returningToGlobalFollow ? restoreNonPinnedConversationSession() : null;
+  const restoredSession = restoredConversation?.settings?.sessionId
+    ? availableSessions.find((item) => item.id === restoredConversation.settings.sessionId) || {
+      id: restoredConversation.settings.sessionId,
+      title: restoredConversation.settings.sessionTitle || restoredConversation.settings.sessionId,
+      source: restoredConversation.settings.sessionSource || DEFAULT_SETTINGS.sessionSource,
+    }
+    : null;
+  const legacyPinnedConversation = returningToGlobalFollow && !restoredConversation;
+
+  contextScope = normalizedScope;
   previousConversationScope = conversationScopeForContextScope(contextScope, previousConversationScope);
-  if (contextScope.mode !== CONTEXT_SCOPE_MODES.CHAT_ONLY) rememberConversationScope(contextScope);
+  if (legacyPinnedConversation) previousConversationScope = snapshot.previousConversationScope;
+  if (contextScope.mode !== CONTEXT_SCOPE_MODES.CHAT_ONLY && !legacyPinnedConversation) rememberConversationScope(contextScope);
   else saveConversationScopeForInstance();
   saveContextScopeForInstance();
   syncSelectedTabsFromContextScope(currentContext.tabs || []);
   renderContextScopeControls();
-  await loadMessagesForActiveScope();
-  if (ensureSession) await ensureSessionForActiveScope({ focus: false });
-  await refreshContext();
+  try {
+    await loadMessagesForActiveScope({ scopeRevisionId });
+    if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+    if (restoredSession) {
+      const opened = await openHermesSession(restoredSession, { scopeRevisionId });
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+      if (!opened) throw new Error('Could not restore the previous conversation for this tab scope.');
+    } else if (ensureSession) {
+      const sessionReady = await ensureSessionForActiveScope({ focus: false, scopeRevisionId });
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+      if (!sessionReady) throw new Error('Could not bind a session for this tab scope.');
+    }
+    await refreshContext({ scopeRevisionId });
+    return scopeRevision.isCurrent(scopeRevisionId);
+  } catch (error) {
+    if (scopeRevision.isCurrent(scopeRevisionId) && snapshot) {
+      restoreScopeTransitionSnapshot(snapshot);
+      try {
+        await browserApi.storage.local.set({ hermesBrowserSettings: snapshot.settings });
+      } catch {
+        // Preserve the original transition error if durable rollback is unavailable.
+      }
+    }
+    if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+    throw error;
+  }
+}
+
+function applyContextScope(nextScope, { ensureSession = false } = {}) {
+  const scopeRevisionId = scopeRevision.begin();
+  const normalizedScope = normalizeContextScope(nextScope);
+  if (!ensureSession && normalizedScope.mode === CONTEXT_SCOPE_MODES.CHAT_ONLY) {
+    contextScope = normalizedScope;
+    syncSelectedTabsFromContextScope(currentContext.tabs || []);
+    saveContextScopeForInstance();
+    saveConversationScopeForInstance();
+    renderContextScopeControls();
+  }
+  const transition = () => commitContextScope(normalizedScope, { ensureSession, scopeRevisionId });
+  const queued = scopeTransitionQueue.then(transition, transition);
+  scopeTransitionQueue = queued.catch(() => undefined);
+  return queued;
+}
+
+async function resolveAttachedPanelOwnerTab() {
+  if (!isAttachedPanelResidency()) return null;
+  try {
+    const owner = await browserApi.tabs.get(Number(sidePanelParams.tabId));
+    return owner?.id ? safeTab(owner) : null;
+  } catch {
+    return null;
+  }
 }
 
 async function pinContextTab(tab) {
-  if (!tab?.id) return;
-  await applyContextScope(contextScopeFromTab(tab, contextScope), { ensureSession: true });
+  if (!tab?.id) return false;
+  const attachedOwner = await resolveAttachedPanelOwnerTab();
+  if (isAttachedPanelResidency() && !attachedOwner) {
+    throw new Error('The attached owner tab is closed or no longer available.');
+  }
+  const action = resolveContextScopeAction({
+    currentScope: contextScope,
+    targetTab: tab,
+    panelMode: settings.panelResidencyMode,
+    attachedTab: attachedOwner,
+    attachedTabId: sidePanelParams.tabId,
+  });
+  if (action.kind === 'noop') return false;
+  const applied = await applyContextScope(action.scope, { ensureSession: true });
+  return applied;
 }
 
 async function pinContextTabById(tabId) {
   const id = Number(tabId);
-  if (!Number.isFinite(id)) return;
-  let tab = currentContext.tabs.find((item) => Number(item.id) === id) || null;
+  if (!Number.isFinite(id)) return false;
+  let tab = null;
   try {
     const freshTab = await browserApi.tabs.get(id);
     if (freshTab?.id) tab = safeTab(freshTab);
   } catch (_error) {
-    // The tab may have closed between render and click. Fall back to the
-    // snapshot from the menu when available so the user does not need a manual
-    // refresh just because the tab list is stale.
+    // The tab may have closed between render and click. Do not pin from the
+    // stale menu snapshot: scope ownership must be based on a live tab.
   }
-  if (!tab) throw new Error('Tab is closed or no longer available.');
-  await pinContextTab(tab);
+  if (!tab) return false;
+  return pinContextTab(tab);
 }
 
 async function unlockContextScope() {
-  await applyContextScope({
-    ...contextScope,
-    mode: CONTEXT_SCOPE_MODES.FOLLOW_ACTIVE,
-    pinnedTabId: null,
-    pinnedWindowId: null,
-    pinnedTitle: '',
-    pinnedUrl: '',
-    selectedTabIds: [],
-  });
+  const attachedOwner = await resolveAttachedPanelOwnerTab();
+  if (isAttachedPanelResidency() && !attachedOwner) {
+    throw new Error('The attached owner tab is closed or no longer available.');
+  }
+  const applied = await applyContextScope(resetContextScope({
+    panelMode: settings.panelResidencyMode,
+    attachedTab: attachedOwner,
+    attachedTabId: sidePanelParams.tabId,
+    previousScope: contextScope,
+  }), { ensureSession: true });
+  return applied;
 }
 
 function setGatewayCapabilities(caps) {
@@ -2714,25 +3435,12 @@ function setGatewayCapabilities(caps) {
 }
 
 async function loadGatewayCapabilities({ quiet = false, publicOnly = false, healthOk = false } = {}) {
-  if (isRemoteWsMode()) {
-    setGatewayCapabilities({
-      ...DEFAULT_GATEWAY_CAPABILITIES,
-      source: 'remote-dashboard',
-      health: remoteWsConnection?.client?.readyState === 1,
-      auth: true,
-      models: true,
-      sessions: true,
-      sessionChat: true,
-      sessionChatStreaming: true,
-      skills: true,
-      dashboardWs: true,
-      warnings: [
-        'Remote dashboard mode uses WebSocket session/chat APIs; REST-only browser extension APIs stay unavailable.',
-        'Voice transcription unavailable - using browser speech fallback when available.',
-        'Image upload unavailable - pasted images stay inline only.',
-        'Automatic browser pairing unavailable - manual dashboard sign-in is required.',
-      ],
-    });
+  if (usesDashboardWsChatTransport()) {
+    const connection = isRemoteWsMode() ? remoteWsConnection : activeDashboardWsConnection;
+    setGatewayCapabilities(dashboardWsGatewayCapabilities({
+      source: isRemoteWsMode() ? 'remote-dashboard' : 'dashboard-ws',
+      health: connection?.client?.readyState === 1,
+    }));
     return gatewayCapabilities;
   }
   try {
@@ -3140,7 +3848,7 @@ function setComposerButtonState(button, state = {}) {
 }
 
 function canSteerActiveRun() {
-  return Boolean(isRemoteWsMode() || gatewayCapabilities.runSteer);
+  return Boolean(usesDashboardWsChatTransport() || gatewayCapabilities.runSteer);
 }
 
 function currentComposerDraftState() {
@@ -3178,6 +3886,8 @@ function updateComposerBusyState() {
     }
   }
   renderQueueNotice();
+  renderSteerNotice();
+  renderCompletionPendingRow();
 }
 
 function activeBotProfileName() {
@@ -3257,6 +3967,59 @@ function renderQueueNotice() {
   els.queueNotice.append(main, actions);
 }
 
+// Steer feedback belongs in the transcript, not the composer dock: a dashed
+// user-side row appears the moment a steer is queued (Desktop surfaces queued
+// steers in the message stream) and leaves when the steered message lands in
+// history or the turn settles.
+function renderSteerNotice() {
+  if (!els.messages) return;
+  const steerText = String(pendingSteerText || '').trim();
+  const existing = els.messages.querySelector('.steer-pending-row');
+  if (!steerText || !sending) {
+    existing?.remove();
+    return;
+  }
+  if (existing) {
+    const body = existing.querySelector('.message-content');
+    if (body && body.dataset.steerText !== steerText) {
+      body.dataset.steerText = steerText;
+      renderMessageContentElement(body, messageDisplayText('user', steerText));
+    }
+    els.messages.appendChild(existing);
+    return;
+  }
+  const node = els.template.content.firstElementChild.cloneNode(true);
+  node.classList.add('user', 'steer-pending-row');
+  node.querySelector('.message-role').textContent = translateUiText('Steer queued · arrives after the next tool call');
+  const body = node.querySelector('.message-content');
+  body.dataset.steerText = steerText;
+  renderMessageContentElement(body, messageDisplayText('user', steerText));
+  els.messages.appendChild(node);
+  scrollMessageStreamToBottom();
+}
+
+// The gateway generates the parent completion turn AFTER a subagent batch
+// finishes. Until its reply lands, the transcript holds the same live thinking
+// row a running turn shows, so the child-to-parent handoff never looks idle.
+function renderCompletionPendingRow() {
+  if (!els.messages) return;
+  const existing = els.messages.querySelector('.completion-pending-row');
+  if (!completionSettlePending) {
+    existing?.remove();
+    return;
+  }
+  if (existing) {
+    els.messages.appendChild(existing);
+    return;
+  }
+  const node = els.template.content.firstElementChild.cloneNode(true);
+  node.classList.add('assistant', 'completion-pending-row');
+  node.querySelector('.message-role').textContent = assistantMessageRoleLabel();
+  renderMessageContentElement(node.querySelector('.message-content'), THINKING_PLACEHOLDER);
+  els.messages.appendChild(node);
+  scrollMessageStreamToBottom();
+}
+
 function queueCurrentDraft() {
   const text = els.input.value.trim();
   if (!text && !attachments.length) return false;
@@ -3307,7 +4070,10 @@ async function sendSteerText(text) {
   if (usesDashboardWsChatTransport()) {
     const connection = await ensureActiveDashboardWsConnection();
     const sessionId = await ensureRemoteWsSession(connection);
-    await connection.client.request(WS_METHODS.sessionSteer, { session_id: sessionId, text: steerText });
+    const result = await connection.client.request(WS_METHODS.sessionSteer, { session_id: sessionId, text: steerText });
+    if (result && result.status === 'rejected') {
+      throw new Error('Hermes could not queue the steer (the turn may be finishing). The text is still in the composer.');
+    }
     return true;
   }
   if (!canSteerActiveRun()) {
@@ -3344,6 +4110,7 @@ async function steerCurrentDraft() {
     return true;
   } catch (error) {
     pendingSteerText = '';
+    renderSteerNotice();
     setStatus('warn', 'Steer failed', error?.message || String(error), { translateDetail: false });
     els.input.focus();
     return false;
@@ -3359,11 +4126,13 @@ async function steerQueuedTurn() {
     if (queuedTurn.attachments?.length) queuedTurn = { text: '', attachments: queuedTurn.attachments };
     else queuedTurn = null;
     renderQueueNotice();
+    renderSteerNotice();
     setStatus('ok', 'Steer sent to active run', 'Hermes will consume the queued text if the current turn reaches an injection point.');
     els.input.focus();
     return true;
   } catch (error) {
     pendingSteerText = '';
+    renderSteerNotice();
     setStatus('warn', 'Steer failed', error?.message || String(error), { translateDetail: false });
     els.input.focus();
     return false;
@@ -3910,6 +4679,7 @@ function renderWakeState(nextState = wakeState) {
     els.wakeButton.setAttribute('aria-pressed', String(enabled));
     els.wakeButton.setAttribute('aria-label', translateUiText(enabled ? 'Turn off wake word' : 'Turn on wake word'));
     els.wakeButton.title = `${translateUiText(provider)}: ${translateUiText(detail)}`;
+    els.wakeButton.hidden = !enabled;
   }
   if (els.wakeWordStatus) els.wakeWordStatus.textContent = `${translateUiText(provider)}: ${translateUiText(detail)}`;
   if (els.wakeWordEnabledInput) els.wakeWordEnabledInput.checked = enabled;
@@ -4026,7 +4796,32 @@ function updateVoiceButtonState() {
     ? 'Voice dictation is not supported in this browser or connected Hermes runtime'
     : (dictating ? `Stop voice dictation (${mode})` : `Start voice dictation (${mode})`);
   els.voiceButton.setAttribute('aria-label', els.voiceButton.title);
-  els.voiceButton.setAttribute('aria-busy', String(voiceTransitionInFlight));
+  els.voiceButton.setAttribute('aria-busy', String(voiceTransitionInFlight || transcribingVoice));
+  renderVoiceActivity();
+}
+
+function renderVoiceActivity() {
+  const meter = els.voiceActivity;
+  if (!meter) return;
+  const session = voiceCaptureSession;
+  const recording = Boolean(dictating && session && !session.stopRequested);
+  const transcribing = Boolean(transcribingVoice);
+  meter.hidden = !(recording || transcribing);
+  meter.classList.toggle('recording', recording);
+  meter.classList.toggle('transcribing', transcribing);
+  if (els.voiceActivityLabel) {
+    els.voiceActivityLabel.textContent = transcribing ? 'Transcribing' : 'Dictating';
+  }
+  if (els.voiceActivityTimer) {
+    const startedAt = Number(session?.startedAt || 0);
+    const seconds = startedAt ? (Date.now() - startedAt) / 1000 : 0;
+    els.voiceActivityTimer.textContent = formatVoiceElapsed(seconds);
+  }
+  const bars = els.voiceActivityBars?.querySelectorAll('i') || [];
+  const heights = voiceLevelBarHeights(Number(session?.level || 0), { active: recording && !transcribing });
+  bars.forEach((bar, index) => {
+    bar.style.height = `${Math.round((heights[index] || 0.25) * 100)}%`;
+  });
 }
 
 function applyDictationTranscript(transcript = '') {
@@ -4046,6 +4841,20 @@ function blobToDataUrl(blob) {
 }
 
 function cleanupVoiceRecorder() {
+  const session = voiceCaptureSession;
+  if (session?.tickTimer) {
+    clearInterval(session.tickTimer);
+    session.tickTimer = null;
+  }
+  if (session?.audioContext) {
+    try {
+      const closing = session.audioContext.close?.();
+      if (closing?.catch) closing.catch(() => {});
+    } catch {
+      /* context already closed */
+    }
+  }
+  voiceCaptureSession = null;
   voiceRecorderStream?.getTracks?.().forEach((track) => track.stop());
   voiceRecorderStream = null;
   voiceRecorder = null;
@@ -4062,11 +4871,16 @@ async function transcribeVoiceRecording(blob) {
   }
   const dataUrl = await blobToDataUrl(blob);
   if (canUseDashboardTranscription && !canUseApiTranscription) {
+    // The Desktop dashboard lives on a discovered random loopback port; the
+    // fixed 9119 constant is only the last-resort fallback.
+    const baseUrl = await resolveDashboardTranscriptionBaseUrl({
+      desktopDashboardUrl,
+      gatewayMode: normalizeGatewayMode(settings.gatewayMode),
+      gatewayUrl: settings.gatewayUrl,
+      discover: () => ensureDesktopDashboardUrl({ timeoutMs: 2_500 }),
+    });
     const result = await transcribeAudioViaDashboard({
-      baseUrl: dashboardModelDiscoveryBaseUrl({
-        gatewayMode: normalizeGatewayMode(settings.gatewayMode),
-        gatewayUrl: settings.gatewayUrl,
-      }),
+      baseUrl,
       profile: settings.activeProfile,
       dataUrl,
       mimeType: blob.type || 'audio/webm',
@@ -4094,6 +4908,30 @@ async function transcribeVoiceRecording(blob) {
   return String(payload?.transcript || '').trim();
 }
 
+function clearSpeechWatchdog() {
+  if (speechWatchdogTimer) clearTimeout(speechWatchdogTimer);
+  speechWatchdogTimer = null;
+}
+
+function armSpeechWatchdog() {
+  clearSpeechWatchdog();
+  speechWatchdogTimer = setTimeout(() => {
+    speechWatchdogTimer = null;
+    if (!speechRecognitionSilentlyFailed({ elapsedMs: SPEECH_SILENT_START_TIMEOUT_MS })) return;
+    try {
+      speechRecognition?.abort?.();
+    } catch {
+      // The session is already dead; abort is best-effort.
+    }
+    clearSpeechWatchdog();
+    dictating = false;
+    updateVoiceButtonState();
+    setStatus('warn', 'Voice dictation unavailable', 'Speech recognition started but never delivered audio or a transcript. This side panel cannot capture microphone audio in this browser; using the Hermes Voice Dictation tab instead.', { translateDetail: false });
+    void openVoiceDictationPage('Browser speech started but never delivered audio in this side panel. Use the visible Hermes Voice Dictation tab to record; the transcript returns to this composer automatically.')
+      .catch((error) => setStatus('warn', 'Voice dictation unavailable', error?.message || String(error), { translateDetail: false }));
+  }, SPEECH_SILENT_START_TIMEOUT_MS);
+}
+
 function ensureSpeechRecognition() {
   if (speechRecognition) return speechRecognition;
   const Recognition = speechRecognitionConstructor();
@@ -4102,7 +4940,11 @@ function ensureSpeechRecognition() {
   recognition.continuous = true;
   recognition.interimResults = true;
   recognition.lang = navigator.language || 'en-US';
+  recognition.onstart = () => {
+    // Comet often fires start with no audio. Keep the silent-start watchdog armed until a result, error, or end.
+  };
   recognition.onresult = (event) => {
+    clearSpeechWatchdog();
     let interim = '';
     for (let index = event.resultIndex; index < event.results.length; index += 1) {
       const transcript = event.results[index]?.[0]?.transcript || '';
@@ -4112,6 +4954,7 @@ function ensureSpeechRecognition() {
     applyDictationTranscript([dictationFinalText, interim].filter(Boolean).join(' '));
   };
   recognition.onerror = (event) => {
+    clearSpeechWatchdog();
     if (isMicrophonePermissionError(event) || shouldOpenVoiceDictationPageForSpeechError(event)) {
       dictating = false;
       updateVoiceButtonState();
@@ -4122,8 +4965,13 @@ function ensureSpeechRecognition() {
     setStatus('warn', 'Voice dictation stopped', event.error || t('voice.speech_recognition_error'), { translateDetail: false });
   };
   recognition.onend = () => {
+    clearSpeechWatchdog();
+    const endedActiveSession = dictating;
     dictating = false;
     updateVoiceButtonState();
+    if (endedActiveSession && !dictationFinalText) {
+      setStatus('warn', 'No speech captured', 'Speech recognition ended without a transcript. If this browser blocks microphone capture in side panels, use the Hermes Voice Dictation tab.', { translateDetail: false });
+    }
   };
   speechRecognition = recognition;
   return speechRecognition;
@@ -4148,6 +4996,7 @@ async function startWebSpeechDictation(detail = 'Speak to dictate into the Herme
     recognition.start();
     dictating = true;
     updateVoiceButtonState();
+    armSpeechWatchdog();
     setStatus(
       'ok',
       preparation.mode === 'local' ? 'Listening on device' : 'Listening',
@@ -4163,67 +5012,240 @@ async function startWebSpeechDictation(detail = 'Speak to dictate into the Herme
 }
 
 async function startRecorderDictation() {
+  // Tear down any previous capture session (stream, monitor interval, audio
+  // context) before opening a new one so a rapid stop/start cannot leave a
+  // second live stream or monitor behind.
+  cleanupVoiceRecorder();
   await ensureMicrophoneOriginPermission();
   voiceRecorderStream = await getMicrophoneStreamWithPermissionRetry();
   const stream = voiceRecorderStream;
+  const now = Date.now();
+  const session = {
+    startedAt: now,
+    segmentStartedAt: now,
+    lastSignalAt: 0,
+    everSawSignal: false,
+    segmentSawSpeech: false,
+    stopRequested: false,
+    tickTimer: null,
+    transcribeChain: null,
+    analyser: null,
+    audioContext: null,
+    sampleBuffer: null,
+    sampleBytes: null,
+  };
+  voiceCaptureSession = session;
+
+  // Monitor real microphone energy so a stream that never delivers audio (a
+  // fork side panel with a muted or detached capture) cannot masquerade as a
+  // working "Recording voice" state. The same monitor rotates segments on
+  // speech pauses so text lands while the user is still talking.
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass) {
+      const audioContext = new AudioContextClass();
+      session.audioContext = audioContext;
+      if (audioContext.state === 'suspended' && audioContext.resume) {
+        void audioContext.resume().catch?.(() => {});
+      }
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      // Keep the graph rendered without any audible output.
+      const gain = audioContext.createGain();
+      gain.gain.value = 0;
+      analyser.connect(gain);
+      gain.connect(audioContext.destination);
+      session.analyser = analyser;
+    }
+  } catch (error) {
+    console.warn('Hermes voice capture monitor unavailable', error);
+    session.analyser = null;
+  }
+
+  startVoiceCaptureSegment();
+  session.tickTimer = setInterval(() => voiceCaptureTick(), VOICE_CAPTURE_SAMPLE_INTERVAL_MS);
+  dictating = true;
+  updateVoiceButtonState();
+  setStatus('ok', 'Dictating', 'Speak now. Click the mic again to stop and transcribe.');
+}
+
+function startVoiceCaptureSegment() {
+  const session = voiceCaptureSession;
+  const stream = voiceRecorderStream;
+  if (!session || !stream || session.stopRequested) return;
   const mimeType = preferredVoiceMimeType();
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
   voiceRecorder = recorder;
   voiceRecorderChunks = [];
+  session.segmentStartedAt = Date.now();
+  session.segmentSawSpeech = false;
 
   recorder.ondataavailable = (event) => {
     if (event.data?.size > 0) voiceRecorderChunks.push(event.data);
   };
   recorder.onerror = (event) => {
-    cleanupVoiceRecorder();
-    dictating = false;
-    updateVoiceButtonState();
+    if (voiceCaptureSession !== session) return;
+    finishVoiceCaptureSession();
     setStatus('warn', 'Voice recording failed', event?.error?.message || t('voice.capture_error'), { translateDetail: false });
   };
-  recorder.onstop = async () => {
-    const chunks = voiceRecorderChunks;
-    const recordingType = recorder.mimeType || mimeType || 'audio/webm';
-    cleanupVoiceRecorder();
-    dictating = false;
-    updateVoiceButtonState();
+  recorder.onstop = () => {
+    void handleVoiceCaptureSegmentStop(recorder);
+  };
+
+  recorder.start(VOICE_CAPTURE_TIMESLICE_MS);
+}
+
+function voiceCaptureTick() {
+  const session = voiceCaptureSession;
+  if (!session || session.stopRequested) return;
+  const analyser = session.analyser;
+  const contextRunning = !session.audioContext || session.audioContext.state === 'running';
+  // Without a usable monitor the stream cannot be judged; never invent an
+  // escalation (or a rotation) from missing measurements.
+  if (!analyser || !contextRunning) return;
+  let peak = 0;
+  try {
+    if (typeof analyser.getFloatTimeDomainData === 'function') {
+      if (!session.sampleBuffer || session.sampleBuffer.length !== analyser.fftSize) {
+        session.sampleBuffer = new Float32Array(analyser.fftSize);
+      }
+      analyser.getFloatTimeDomainData(session.sampleBuffer);
+      peak = voiceCapturePeak(session.sampleBuffer);
+    } else if (typeof analyser.getByteTimeDomainData === 'function') {
+      if (!session.sampleBytes || session.sampleBytes.length !== analyser.fftSize) {
+        session.sampleBytes = new Uint8Array(analyser.fftSize);
+      }
+      analyser.getByteTimeDomainData(session.sampleBytes);
+      peak = voiceCapturePeakFromBytes(session.sampleBytes);
+    } else {
+      return;
+    }
+  } catch {
+    return;
+  }
+  const tickedAt = Date.now();
+  session.level = peak;
+  if (voiceCaptureIsSignal({ peak })) {
+    session.everSawSignal = true;
+    session.segmentSawSpeech = true;
+    session.lastSignalAt = tickedAt;
+  }
+  renderVoiceActivity();
+  const action = voiceCaptureDecision({
+    elapsedMs: tickedAt - session.startedAt,
+    everSawSignal: session.everSawSignal,
+  });
+  if (action === 'escalate') {
+    escalateSilentVoiceCapture();
+  }
+}
+
+function escalateSilentVoiceCapture() {
+  const session = voiceCaptureSession;
+  if (!session) return;
+  session.stopRequested = true;
+  session.escalated = true;
+  dictating = false;
+  updateVoiceButtonState();
+  const recorder = voiceRecorder;
+  if (recorder && recorder.state !== 'inactive') {
+    try {
+      recorder.stop();
+    } catch {
+      /* the session is being torn down anyway */
+    }
+  }
+  cleanupVoiceRecorder();
+  setStatus(
+    'warn',
+    'Voice dictation moved to its own tab',
+    'The side panel microphone delivered no audio. Opening the Hermes Voice Dictation tab — record there and the transcript returns to this composer automatically.',
+    { translateDetail: false },
+  );
+  void openVoiceDictationPage('This side panel microphone produced no audio. Use the visible Hermes Voice Dictation tab; the transcript returns to this composer automatically.')
+    .catch((error) => setStatus('warn', 'Voice dictation unavailable', error?.message || String(error), { translateDetail: false }));
+}
+
+async function handleVoiceCaptureSegmentStop(recorder) {
+  const session = voiceCaptureSession;
+  const chunks = voiceRecorderChunks;
+  const recordingType = recorder?.mimeType || preferredVoiceMimeType() || 'audio/webm';
+  voiceRecorder = null;
+  voiceRecorderChunks = [];
+  const stopRequested = Boolean(session?.stopRequested);
+  const isCurrent = () => Boolean(session) && voiceCaptureSession === session;
+
+  const processSegment = async () => {
+    if (!isCurrent()) return; // stale handler from a previous capture session
+    if (session.escalated) {
+      finishVoiceCaptureSession();
+      return;
+    }
     if (!chunks.length) {
+      finishVoiceCaptureSession();
       setStatus('warn', 'No speech captured', 'Try recording again.');
       return;
     }
     try {
-      setStatus('ok', 'Transcribing voice', 'Using Hermes speech-to-text, matching Desktop dictation.');
+      transcribingVoice = true;
+      updateVoiceButtonState();
+      setStatus('ok', 'Transcribing', 'Analyzing what you said with Hermes speech-to-text.');
       const transcript = await transcribeVoiceRecording(new Blob(chunks, { type: recordingType }));
+      if (!isCurrent()) return;
       if (!transcript) {
+        finishVoiceCaptureSession();
         setStatus('warn', 'No speech detected', 'Try recording again.');
         return;
       }
-      applyDictationTranscript(transcript);
+      dictationFinalText = joinDictationTranscript(dictationFinalText, transcript);
+      applyDictationTranscript(dictationFinalText);
+      finishVoiceCaptureSession();
       setStatus('ok', 'Voice dictation ready', 'Transcript inserted into the composer.');
     } catch (error) {
-      if (error?.fallbackToWebSpeech && await startWebSpeechDictation('Hermes transcription route is unavailable. Using browser speech fallback; speak again.')) {
-        return;
-      }
+      const current = isCurrent();
+      if (current) finishVoiceCaptureSession();
+      if (current && error?.fallbackToWebSpeech && await startWebSpeechDictation('Hermes transcription route is unavailable. Using browser speech fallback; speak again.')) return;
       setStatus('warn', 'Voice transcription failed', error?.message || String(error), { translateDetail: false });
     }
   };
 
-  recorder.start();
-  dictating = true;
+  if (session) {
+    session.transcribeChain = (session.transcribeChain || Promise.resolve()).then(processSegment, processSegment);
+    await session.transcribeChain;
+  } else {
+    await processSegment();
+  }
+}
+
+function finishVoiceCaptureSession() {
+  dictating = false;
+  transcribingVoice = false;
   updateVoiceButtonState();
-  setStatus('ok', 'Recording voice', 'Click the mic again to transcribe with Hermes speech-to-text.');
+  cleanupVoiceRecorder();
 }
 
 function stopRecorderDictation() {
+  const session = voiceCaptureSession;
+  if (!session) return false;
+  session.stopRequested = true;
+  dictating = false;
+  transcribingVoice = true;
+  updateVoiceButtonState();
+  setStatus('ok', 'Transcribing', 'Analyzing what you said with Hermes speech-to-text.');
   const recorder = voiceRecorder;
-  if (!recorder) return false;
-  try {
-    if (recorder.state !== 'inactive') recorder.stop();
-  } catch (error) {
-    cleanupVoiceRecorder();
-    dictating = false;
-    updateVoiceButtonState();
-    setStatus('warn', 'Voice recording failed', error?.message || String(error), { translateDetail: false });
+  if (recorder && recorder.state !== 'inactive') {
+    try {
+      recorder.stop();
+    } catch (error) {
+      finishVoiceCaptureSession();
+      setStatus('warn', 'Voice recording failed', error?.message || String(error), { translateDetail: false });
+    }
+    return true;
   }
+  // If the recorder already stopped, finish unless a transcription is in flight.
+  if (!session.transcribeChain) finishVoiceCaptureSession();
   return true;
 }
 
@@ -4252,6 +5274,7 @@ async function toggleVoiceDictation() {
       updateVoiceButtonState();
       setStatus('warn', 'Voice dictation stopped', error?.message || String(error), { translateDetail: false });
     }
+    clearSpeechWatchdog();
     return;
   }
 
@@ -4271,10 +5294,15 @@ async function toggleVoiceDictation() {
     }
 
     await loadVoiceGatewayCapabilities();
-    const canUseRecorderTranscription = canUseHermesVoiceTranscription()
-      || canUseLocalDashboardVoiceTranscription();
-    if (!canUseRecorderTranscription) {
-      if (browserSpeechAvailable() && await startWebSpeechDictation('Hermes transcription route is unavailable. Using browser speech fallback.')) return;
+    const captureRoute = voiceDictationCaptureRoute({
+      canRecord: canRecordVoiceAudio(),
+      canUseApiTranscription: canUseHermesVoiceTranscription(),
+      canUseDashboardTranscription: canUseLocalDashboardVoiceTranscription(),
+      browserSpeech: browserSpeechAvailable(),
+    });
+    if (captureRoute !== 'recorder') {
+      if (captureRoute === 'web-speech'
+        && await startWebSpeechDictation('Hermes transcription route is unavailable. Using browser speech fallback.')) return;
       await openVoiceDictationPage('This browser speech service is unavailable in the side panel. Use the visible Hermes Voice Dictation tab to capture audio and dictate into this composer.');
       return;
     }
@@ -5102,18 +6130,21 @@ function addAttachment(attachment) {
   attachments = [...attachments.filter((item) => item.id !== attachment.id), attachment];
   renderAttachments();
   renderContextWindow();
+  persistCurrentComposerDraft();
 }
 
 function removeAttachment(id) {
   attachments = attachments.filter((item) => item.id !== id);
   renderAttachments();
   renderContextWindow();
+  persistCurrentComposerDraft({ immediate: true });
 }
 
 function clearAttachments() {
   attachments = [];
   renderAttachments();
   renderContextWindow();
+  persistCurrentComposerDraft({ immediate: true });
 }
 
 function renderAttachments() {
@@ -5221,6 +6252,42 @@ async function saveImageAttachmentsForTurn(items = []) {
   return next;
 }
 
+// Local dashboard turns carry no pixels through `prompt.submit`, so pasted
+// images must ride the gateway's session-scoped `image.attach_bytes` RPC (the
+// same contract Hermes Desktop uses) before the prompt submits. The gateway
+// writes the file next to the session, queues it, and the next prompt.submit
+// routes it into the run so the model can actually open the screenshot.
+async function attachDashboardTurnImages(client, sessionId, items = []) {
+  const pending = items.filter((attachment) => attachment.kind === 'image'
+    && attachment.dataUrl
+    && attachment.dashboardAttachedSessionId !== sessionId);
+  if (!pending.length || !client || !sessionId) return items;
+  let attached = 0;
+  let failed = 0;
+  for (const attachment of pending) {
+    try {
+      const result = await client.request(WS_METHODS.imageAttachBytes, {
+        session_id: sessionId,
+        content_base64: attachment.dataUrl,
+        filename: attachment.label || 'image.png',
+      });
+      if (result?.attached !== true) throw new Error(result?.message || 'Hermes did not confirm the image attach.');
+      attachment.dashboardAttachedSessionId = sessionId;
+      if (result.path) {
+        attachment.localPath = result.path;
+        attachment.detail = `${attachment.detail || 'image'} · attached for Hermes vision`;
+      }
+      attached += 1;
+    } catch (error) {
+      failed += 1;
+      attachment.uploadError = error?.message || String(error);
+    }
+  }
+  if (attached) setStatus('ok', 'Image ready for Hermes vision', `${attached} pasted image${attached === 1 ? '' : 's'} attached to this session`);
+  if (failed) setStatus('warn', 'Image stayed inline only', `${failed} image${failed === 1 ? '' : 's'} could not be attached to the live session`);
+  return items;
+}
+
 async function attachFiles(fileList, { imagesOnly = false } = {}) {
   const files = Array.from(fileList || []);
   for (const file of files) {
@@ -5247,6 +6314,8 @@ async function attachFiles(fileList, { imagesOnly = false } = {}) {
       text: text || `[${file.name || 'file'} attached as metadata only: ${formatBytes(file.size)}. Browser cannot expose a stable local path; use Hermes Desktop for path-backed file refs.]`,
     });
   }
+  await ensureImageAttachmentsSaved();
+  persistCurrentComposerDraft({ immediate: true });
 }
 
 async function attachFolder(fileList) {
@@ -6033,10 +7102,14 @@ function renderContextWindow(userText = els.input?.value || '') {
 
   const pc = currentContext?.pageContext;
   if (contextScope.mode === CONTEXT_SCOPE_MODES.CHAT_ONLY) {
+    // The composer's scope button already reads "Chat only"; the chip row
+    // would only repeat it and eat vertical space.
+    if (els.contextChip) els.contextChip.hidden = true;
     els.contextChipLabel.textContent = translateUiText('💬 Chat only');
     els.contextChip.title = translateUiText('No browser tab, selected text, open tabs, metadata, transcript, or page text will be attached.');
     els.contextPreview.textContent = translateUiText('Chat only mode is active. Hermes will not read or attach browser context for this turn.');
   } else {
+    if (els.contextChip) els.contextChip.hidden = false;
     const chip = contextChipSummary({ pageContext: pc, activeTab: currentContext.activeTab, parts: stats.parts });
     els.contextChipLabel.textContent = translateUiText(chip.label);
     els.contextChip.title = translateUiText(chip.title);
@@ -6658,10 +7731,32 @@ async function refreshModelsFromMenu() {
 }
 
 async function loadSkills({ quiet = false } = {}) {
-  if (!settings.apiKey) {
+  if (usesDashboardWsChatTransport()) {
+    const connection = isRemoteWsMode()
+      ? remoteWsConnection
+      : (profileWsConnection?.client?.readyState === 1 ? profileWsConnection : activeDashboardWsConnection);
+    if (connection?.client?.readyState === 1) {
+      try {
+        const profile = safeActiveProfile() || 'default';
+        const payload = await connection.client.request(WS_METHODS.profilesDescribe, { name: profile });
+        availableSkills = normalizeHermesSkills({ data: payload?.skills || [] });
+        renderSkillSuggestions();
+        if (!quiet) setStatus('ok', 'Hermes skills synced', `${availableSkills.length} /skill commands available`);
+        return { ok: true, count: availableSkills.length, source: 'dashboard-ws' };
+      } catch (error) {
+        if (!settings.apiKey || !restSkillsFallbackAllowed({ profileName: safeActiveProfile() || 'default' })) {
+          availableSkills = [];
+          renderSkillSuggestions();
+          if (!quiet) setStatus('warn', 'Skill sync failed', error?.message || String(error), { translateDetail: false });
+          return { ok: false, count: 0, error: error?.message || String(error) };
+        }
+      }
+    }
+  }
+  if (!settings.apiKey || !restSkillsFallbackAllowed({ profileName: safeActiveProfile() || 'default' })) {
     availableSkills = [];
     renderSkillSuggestions();
-    return;
+    return { ok: false, count: 0, error: 'Connect to Hermes before refreshing skills.' };
   }
   try {
     const response = await apiFetch('/v1/skills', {
@@ -6677,6 +7772,7 @@ async function loadSkills({ quiet = false } = {}) {
     availableSkills = [];
     renderSkillSuggestions();
     if (!quiet) setStatus('warn', 'Skill sync failed', error?.message || String(error), { translateDetail: false });
+    return { ok: false, count: 0, error: error?.message || String(error) };
   }
 }
 
@@ -7085,9 +8181,24 @@ function dashboardTicketOriginMatches(baseUrl = '') {
   return Boolean(expected && actual && expected === actual);
 }
 
-async function ensureDesktopDashboardUrl({ timeoutMs = 2_500 } = {}) {
+async function localhostDashboardCandidateUrls() {
+  try {
+    const tabs = await browserApi.tabs.query({ url: ['http://127.0.0.1/*', 'http://localhost/*'] });
+    return [...new Set((Array.isArray(tabs) ? tabs : []).map((tab) => {
+      try {
+        return new URL(String(tab?.url || '')).origin;
+      } catch {
+        return '';
+      }
+    }).filter(Boolean))];
+  } catch {
+    return [];
+  }
+}
+
+async function ensureDesktopDashboardUrl({ timeoutMs = 8_000 } = {}) {
   if (desktopDashboardUrl) {
-    const alive = await fetch(desktopDashboardUrl, {
+    const alive = await dashboardFetch(desktopDashboardUrl, {
       method: 'GET',
       signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(300) : undefined,
       cache: 'no-store',
@@ -7098,13 +8209,15 @@ async function ensureDesktopDashboardUrl({ timeoutMs = 2_500 } = {}) {
   if (!desktopDashboardDiscoveryPromise) {
     desktopDashboardDiscoveryPromise = (async () => {
       const cached = await readCachedRosterUrl();
+      const candidateUrls = await localhostDashboardCandidateUrls();
       const discovered = await discoverLocalDashboardBaseUrl({
         cachedUrl: cached.url,
         cachedAt: cached.cachedAt,
+        candidateUrls,
         gatewayUrl: normalizeGatewayUrl(settings.gatewayUrl),
         apiKey: hermesGatewayKey(),
-        fetchFn: fetch,
-        timeoutMs,
+        fetchFn: dashboardFetch,
+        timeoutMs: Math.max(8_000, Number(timeoutMs) || 8_000),
       });
       if (discovered) {
         desktopDashboardUrl = discovered;
@@ -7115,8 +8228,17 @@ async function ensureDesktopDashboardUrl({ timeoutMs = 2_500 } = {}) {
       desktopDashboardDiscoveryPromise = null;
     });
   }
+  const discovery = desktopDashboardDiscoveryPromise;
   const timer = new Promise((resolve) => setTimeout(() => resolve(''), Math.max(500, timeoutMs)));
-  return Promise.race([desktopDashboardDiscoveryPromise, timer]);
+  const raced = await Promise.race([discovery, timer]);
+  if (raced) return raced;
+  void discovery.then((url) => {
+    if (!url || desktopDashboardUrl === url) return;
+    desktopDashboardUrl = url;
+    void writeCachedRosterUrl(url);
+    void loadProfiles({ quiet: true, allowDashboardTrust: true });
+  });
+  return desktopDashboardUrl || '';
 }
 
 async function ensureProfileWsConnection({ readyTimeoutMs = 8_000, allowDashboardTrust = false } = {}) {
@@ -7134,15 +8256,24 @@ async function ensureProfileWsConnection({ readyTimeoutMs = 8_000, allowDashboar
   if (profileWsConnection?.client?.readyState === 1 && profileWsConnection.key === key) {
     return profileWsConnection;
   }
+  // Legacy loopback dashboards expose a session bootstrap to permitted local
+  // clients. Resolve it before considering interactive Dashboard Attach.
+  let dashboardToken = '';
+  try {
+    const rootResponse = await dashboardFetch(baseUrl, { headers: { Accept: 'text/html' }, cache: 'no-store', redirect: 'error' });
+    if (rootResponse.ok) dashboardToken = extractDashboardSessionToken(await rootResponse.text());
+  } catch {
+    // Authenticated dashboards use the explicit signed-in tab below.
+  }
   // Auth-gated local dashboards use the same explicitly trusted, signed-in
-  // Dashboard tab and one-use ticket as Remote Dashboard Attach. The local API
+  // Dashboard tab and one-use ticket as Remote Dashboard Attach.
   // key authenticates port 8642; it cannot authenticate the dashboard on 9119.
   let trustedTab = null;
   if (Number.isFinite(trustedDashboardTabId) && dashboardTicketOriginMatches(baseUrl)) {
     trustedTab = await findDashboardTab(browserApi.tabs, originOf(baseUrl), trustedDashboardTabId);
     if (!trustedTab) trustedDashboardTabId = null;
   }
-  if (allowDashboardTrust && !trustedTab) {
+  if (allowDashboardTrust && !trustedTab && !dashboardToken) {
     await requestDashboardOriginTrust(baseUrl, { local: true });
     trustedTab = await findDashboardTab(browserApi.tabs, originOf(baseUrl), trustedDashboardTabId);
   }
@@ -7192,15 +8323,6 @@ async function ensureProfileWsConnection({ readyTimeoutMs = 8_000, allowDashboar
   gatewayClient.on('profiles.changed', () => {
     void loadProfiles({ quiet: true });
   });
-  let dashboardToken = '';
-  if (desktopDashboardUrl) {
-    try {
-      const rootResponse = await fetch(baseUrl, { headers: { Accept: 'text/html' }, cache: 'no-store' });
-      dashboardToken = extractDashboardSessionToken(await rootResponse.text());
-    } catch {
-      dashboardToken = '';
-    }
-  }
   const wsUrl = dashboardToken
     ? buildDashboardWsUrlWithCredential(baseUrl, 'token', dashboardToken)
     : (!desktopDashboardUrl && settings.apiKey
@@ -7221,7 +8343,7 @@ async function ensureProfileWsConnection({ readyTimeoutMs = 8_000, allowDashboar
           desktopDashboardUrl = freshUrl;
           await writeCachedRosterUrl(freshUrl);
           const freshBase = normalizeGatewayUrl(freshUrl);
-          const rootRes = await fetch(freshBase, { headers: { Accept: 'text/html' }, cache: 'no-store' });
+          const rootRes = await dashboardFetch(freshBase, { headers: { Accept: 'text/html' }, cache: 'no-store', redirect: 'error' });
           const freshToken = extractDashboardSessionToken(await rootRes.text());
           const freshWs = freshToken ? buildDashboardWsUrlWithCredential(freshBase, 'token', freshToken) : buildDashboardWsUrl(freshBase);
           await gatewayClient.connect(freshWs);
@@ -7243,6 +8365,7 @@ function usesDashboardWsChatTransport() {
 async function ensureActiveDashboardWsConnection() {
   const connection = isRemoteWsMode() ? await ensureRemoteWsClient() : await ensureProfileWsConnection();
   activeDashboardWsConnection = connection;
+  bindSubagentClient(connection?.client);
   return connection;
 }
 
@@ -7329,7 +8452,6 @@ function remoteAvatarImageOf(remoteAvatar) {
 }
 
 async function refreshPetAvatarCache() {
-  if (settings.botModeEnabled !== true) return;
   try {
     const all = await readAllPetAvatars();
     petAvatarsByProfile.clear();
@@ -7342,10 +8464,22 @@ async function refreshPetAvatarCache() {
 }
 
 function appendBotModeAvatar(container, displayName, profileName = '', remoteAvatar = null) {
+  const override = botProfileOverrideFor(profileName);
+  const overrideImage = typeof override?.icon === 'string' && override.icon.startsWith('data:image/')
+    ? override.icon
+    : '';
   const remoteImage = remoteAvatarImageOf(remoteAvatar);
   if (remoteImage) {
     const img = document.createElement('img');
     img.src = remoteImage;
+    img.alt = '';
+    img.className = 'bot-mode-avatar-pet';
+    container.replaceChildren(img);
+    return;
+  }
+  if (overrideImage) {
+    const img = document.createElement('img');
+    img.src = overrideImage;
     img.alt = '';
     img.className = 'bot-mode-avatar-pet';
     container.replaceChildren(img);
@@ -7361,7 +8495,7 @@ function appendBotModeAvatar(container, displayName, profileName = '', remoteAva
     container.replaceChildren(img);
     return;
   }
-  const seed = displayName || profileName || 'agent';
+  const seed = override?.blobatarSeed || displayName || profileName || 'agent';
   let svgMarkup = '';
   try {
     svgMarkup = blobatarSvg(seed, { size: 40 });
@@ -8344,136 +9478,55 @@ const CANONICAL_FALLBACK_GROUP_CHATS = [];
 
 let desktopDashboardUrl = '';
 
-async function loadProfiles({ quiet = false, allowDashboardTrust = !quiet } = {}) {
-  // Profiles load regardless of Bot Mode: the Settings → Active profile
-  // selector and regular (non-Bot) sessions need the verified roster too.
-  // Bot Mode only adds the deck/roster UI on top; the underlying profile
-  // data is a shared Hermes runtime surface, not a Bot Mode feature.
-  const generation = ++botModeRosterGeneration;
-  // Local API mode: the sidecar (8642) has no roster REST route and its /api/ws
-  // only exists on the desktop dashboard, which sits on a random loopback port.
-  //
-  // Route order matters: the gateway WebSocket profiles.list RPC returns the
-  // RICH roster (ui_meta bot titles/avatars, canonical Bot Chat previews, and
-  // the hermes-bots-groups projection), while the dashboard REST /api/profiles
-  // endpoint strips ui_meta. REST first meant group chats never synced and
-  // roster rows fell back to placeholders. WS is tried first, REST second —
-  // both are absorbed into the same merge so whichever succeeds wins, and a
-  // successful REST only upgrades agents, never erases synced groups.
-  const applyRoster = (split, sourceId, { allowCanonicalFallback = true } = {}) => {
-    if (generation !== botModeRosterGeneration) return;
-    botModeRosterNote = '';
-    availableProfiles = botProfileRowsToHermesProfiles(split.agents, settings.activeProfile);
-    adoptSyncedGroupChats(split.groupChats, { allowCanonicalFallback });
-    botModeRoster = split.agents;
-    renderProfiles();
-    renderBotModeRoster(els.botModeSearch?.value);
-    if (!quiet) setStatus('ok', 'Hermes profiles synced', `${availableProfiles.length} profile${availableProfiles.length === 1 ? '' : 's'} available`);
-  };
-  let rosterLoaded = false;
-  const createRichRosterPromise = () => {
-    let pending;
-    pending = (async () => {
-      try {
-        const connection = await ensureProfileWsConnection({ readyTimeoutMs: 5_000, allowDashboardTrust });
-        return {
-          payload: await connection.client.request(WS_METHODS.profilesList, { include_sessions: true }),
-          sourceId: connection.baseUrl || normalizeGatewayUrl(settings.gatewayUrl),
-        };
-      } catch (error) {
-        return { error };
-      }
-    })().finally(() => {
-      if (profileRichRosterPromise === pending) {
-        profileRichRosterPromise = null;
-        profileRichRosterAllowsTrust = false;
-      }
-    });
-    profileRichRosterPromise = pending;
-    profileRichRosterAllowsTrust = allowDashboardTrust;
-    return pending;
-  };
-  const mayReuseRichRoster = profileRichRosterPromise
-    && !(allowDashboardTrust && !profileRichRosterAllowsTrust);
-  const richRosterPromise = mayReuseRichRoster
-    ? profileRichRosterPromise
-    : createRichRosterPromise();
-  const applyRichRoster = (result) => {
-    if (generation !== botModeRosterGeneration || !result?.payload) return false;
-    const split = splitBotRosterRows(result.payload, { sourceId: result.sourceId });
-    if (!split.agents.length && !split.groupChats.length) return false;
-    applyRoster(split, result.sourceId);
-    rosterLoaded = true;
-    return true;
-  };
-  void richRosterPromise.then((result) => {
-    const applied = applyRichRoster(result);
-    if (!applied && result?.error && generation === botModeRosterGeneration && !botModeGroupChats.length) {
-      adoptSyncedGroupChats([], { allowCanonicalFallback: true });
-    }
-  }).catch(() => undefined);
-  if (!isRemoteWsMode()) {
-    try {
-      if (desktopDashboardUrl) {
-        // Verify that the cached dashboard port is still alive before querying
-        const aliveCheck = await fetch(desktopDashboardUrl, { method: 'GET', signal: AbortSignal.timeout(300) }).catch(() => null);
-        if (!aliveCheck || !aliveCheck.ok) desktopDashboardUrl = '';
-      }
-      if (!desktopDashboardUrl) {
-        desktopDashboardUrl = await ensureDesktopDashboardUrl({ timeoutMs: 3_500 });
-      }
-      if (desktopDashboardUrl) {
-        const payload = await Promise.race([
-          fetchRosterFromDashboard({ baseUrl: desktopDashboardUrl, fetchFn: fetch }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('dashboard-roster-timeout')), 4_000)),
-        ]);
-        if (generation !== botModeRosterGeneration) return;
-        const split = splitBotRosterRows(payload, { sourceId: desktopDashboardUrl });
-        if (split.agents.length && !rosterLoaded) {
-          applyRoster(split, desktopDashboardUrl, { allowCanonicalFallback: false });
-          rosterLoaded = true;
-          // REST payload strips ui_meta, so it can never carry the group
-          // projection. Let the WS attempt below upgrade the roster with bot
-          // titles, previews, and group chats; its failure is non-fatal.
-        }
-      }
-    } catch (error) {
-      if (generation !== botModeRosterGeneration) return;
-      botModeRosterNote = error?.message === 'dashboard-authentication-required'
-        ? 'Dashboard authentication required. Open the signed-in local Dashboard tab, then refresh profiles to authorize Bot Mode.'
-        : 'Desktop dashboard roster unavailable; trying the gateway WebSocket.';
-    }
-  }
-  if (rosterLoaded) return;
-  const richResult = await Promise.race([
-    richRosterPromise,
-    new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 5_500)),
-  ]);
-  if (generation !== botModeRosterGeneration) return;
-  applyRichRoster(richResult);
-  if (rosterLoaded) {
-    if (!botModeGroupChats.length && richResult?.error) {
-      adoptSyncedGroupChats([], { allowCanonicalFallback: true });
-    }
+function scheduleRosterRetry({ force = false } = {}) {
+  if (botModeRoster.length && !force) {
+    rosterRetryCount = 0;
     return;
   }
-  if (richResult?.timedOut) {
-    botModeRosterNote = 'Hermes is still syncing the rich Bot Mode roster in the background.';
-  }
-  if (richResult?.error && allowDashboardTrust) {
-    botModeRosterNote = String(richResult.error?.message || botModeRosterNote);
-  }
+  if (rosterRetryCount >= 3) return;
+  rosterRetryCount += 1;
+  const delayMs = 1200 * rosterRetryCount;
+  setTimeout(() => {
+    void loadProfiles({ quiet: true, allowDashboardTrust: true });
+  }, delayMs);
+}
 
-  // Do NOT inject synthetic/hardcoded agent profiles.
-  // Profiles belong entirely to the user's actual connected Hermes gateway/dashboard.
-  if (!botModeRoster.length) {
-    availableProfiles = [];
-    botModeRoster = [];
-    adoptSyncedGroupChats([]);
+async function loadProfiles({ quiet = false, allowDashboardTrust = !quiet } = {}) {
+  // Profiles load regardless of Bot Mode. Only the authenticated profiles.list
+  // contract owns bot names, assets, activity, canonical sessions and groups.
+  // Public status and REST profile summaries are discovery, never roster data.
+  const generation = ++botModeRosterGeneration;
+  const gatewayUrl = normalizeGatewayUrl(settings.gatewayUrl);
+  try {
+    const connection = await ensureProfileWsConnection({ readyTimeoutMs: 8_000, allowDashboardTrust });
+    const payload = await connection.client.request(WS_METHODS.profilesList, { include_sessions: true });
+    if (generation !== botModeRosterGeneration || gatewayUrl !== normalizeGatewayUrl(settings.gatewayUrl)) return;
+    if (!Array.isArray(payload?.profiles)) throw new Error('invalid-profile-roster');
+    const sourceId = connection.baseUrl || gatewayUrl;
+    const split = splitBotRosterRows(payload, { sourceId });
+    availableProfiles = botProfileRowsToHermesProfiles(split.agents, settings.activeProfile);
+    botModeRoster = split.agents;
+    adoptSyncedGroupChats(split.groupChats, { allowCanonicalFallback: false });
+    botModeRosterNote = '';
+    rosterRetryCount = 0;
+    botModeRemoteAvatarCache.clear();
+    await writeLastKnownRoster({ agents: split.agents, groupChats: split.groupChats, sourceId });
+    if (generation !== botModeRosterGeneration) return;
     renderProfiles();
     renderBotModeRoster(els.botModeSearch?.value);
     renderBotModeGroupChats(els.botModeSearch?.value);
-    if (!quiet) setStatus('ok', 'Hermes profiles checked', 'No custom profiles found on gateway. Using default profile.');
+    void loadSessions({ quiet: true });
+    if (!quiet) setStatus('ok', 'Hermes profiles synced', `${availableProfiles.length} profile${availableProfiles.length === 1 ? '' : 's'} available`);
+  } catch {
+    if (generation !== botModeRosterGeneration || gatewayUrl !== normalizeGatewayUrl(settings.gatewayUrl)) return;
+    // Preserve live rich rows and groups. Do not restore legacy caches: earlier
+    // versions persisted status-only rows without authority or connection scope.
+    botModeRosterNote = 'Desktop profile sync unavailable. Existing bot details are preserved. Open the connected Dashboard and refresh profiles to reconnect.';
+    renderProfiles();
+    renderBotModeRoster(els.botModeSearch?.value);
+    renderBotModeGroupChats(els.botModeSearch?.value);
+    if (!quiet) setStatus('warn', 'Desktop profile sync unavailable', botModeRosterNote, { translateDetail: false });
+    scheduleRosterRetry({ force: true });
   }
 }
 
@@ -8730,6 +9783,11 @@ async function applySelectedProfile(profileName = '', { quiet = false, viaBotMod
   }).catch(() => undefined);
   // The cron schedule is profile-scoped: re-read it for the newly active agent.
   void loadCronJobs({ quiet: true });
+  // Skill commands are profile-scoped too; refresh them after every successful
+  // profile boundary so the composer never keeps the prior profile's catalog.
+  void ensureProfileWsConnection()
+    .then(() => loadSkills({ quiet: true }))
+    .catch(() => loadSkills({ quiet: true }));
   return true;
 }
 
@@ -8901,6 +9959,23 @@ async function loadCronJobs({ quiet = false } = {}) {
   }
 }
 
+async function listCanonicalBotChatViaGateway(profileName) {
+  const base = String(normalizeGatewayUrl(settings.gatewayUrl) || '').replace(/\/$/, '');
+  const name = String(profileName || '').trim();
+  if (!base || !name) return null;
+  const key = hermesGatewayKey();
+  const url = `${base}/p/${encodeURIComponent(name)}/api/sessions?title=${encodeURIComponent(BOT_CHAT_TITLE)}&include_hidden=true&limit=5`;
+  const headers = { Accept: 'application/json' };
+  if (key) headers.Authorization = `Bearer ${key}`;
+  const response = await fetch(url, { headers, credentials: 'omit', cache: 'no-store' });
+  if (!response.ok) return null;
+  const payload = await response.json();
+  const rows = Array.isArray(payload?.data)
+    ? payload.data
+    : (Array.isArray(payload?.sessions) ? payload.sessions : []);
+  return rows.find((entry) => String(entry?.title || '') === BOT_CHAT_TITLE) || rows[0] || null;
+}
+
 async function openBotProfile(row) {
   // Bot Mode deck navigation is panel-owned: a stale UNCONFIRMED run-control
   // from a previous failed attempt must never wedge the deck open forever.
@@ -9003,49 +10078,25 @@ async function openBotProfile(row) {
   // only create a fresh one when the bot has never chatted.
   // The user stays on the sleek centered botModeLoadingOverlay until the session is ready!
   try {
-    let sessionReady = false;
-    try {
-      const resumePromise = (async () => {
-        const connection = await ensureActiveDashboardWsConnection();
-        const listed = await connection.client.request('session.list', {
-          title: BOT_CHAT_TITLE,
-          include_hidden: true,
-          profile: row.profileName,
-          limit: 5,
-        });
-        const rows = Array.isArray(listed?.sessions) ? listed.sessions : (Array.isArray(listed) ? listed : []);
-        const canonical = rows.find((entry) => String(entry?.title || '') === BOT_CHAT_TITLE) || rows[0] || null;
-        if (canonical?.id) {
-          const opened = await openHermesSession({
-            id: canonical.id,
-            title: BOT_CHAT_TITLE,
-            source: 'hermes_bot_mode',
-            profile: row.profileName,
-            transport: 'dashboard-ws',
-          });
-          return opened === true;
-        }
-        return false;
-      })();
-      const timeout = new Promise((resolve) => setTimeout(() => resolve(false), 8_000));
-      sessionReady = await Promise.race([resumePromise, timeout]);
-    } catch (resumeErr) {
-      console.warn('[Hermes Browser] Bot session resume fell through:', resumeErr?.message || resumeErr);
-      sessionReady = false;
-    }
-
-    if (!sessionReady) {
-      try {
-        await createHermesBrowserSession({ title: BOT_CHAT_TITLE, hidden: true, focus: true, transport: 'dashboard-ws', source: 'hermes_bot_mode' });
-      } catch (wsCreateErr) {
-        console.warn('[Hermes Browser] dashboard-ws create fell back to rest:', wsCreateErr?.message || wsCreateErr);
-        await createHermesBrowserSession({ title: BOT_CHAT_TITLE, hidden: true, focus: true, transport: 'rest', source: 'hermes_bot_mode' });
-      }
+    const connection = await ensureActiveDashboardWsConnection();
+    const canonical = await resolveCanonicalBotSession(row, (params) => connection.client.request('session.list', { ...params, limit: 200 }));
+    if (canonical) {
+      const opened = await openHermesSession({
+        id: canonical.durableId,
+        title: BOT_CHAT_TITLE,
+        source: 'hermes_bot_mode',
+        profile: row.profileName,
+        transport: 'dashboard-ws',
+      });
+      if (opened !== true) throw new Error('Could not resume the existing Bot Chat. No replacement was created.');
+    } else {
+      const created = await createHermesBrowserSession({ title: BOT_CHAT_TITLE, hidden: true, focus: true, transport: 'dashboard-ws', source: 'hermes_bot_mode' });
+      if (!created) throw new Error('Bot Chat creation did not complete.');
     }
     return true;
   } catch (err) {
-    console.warn('[Hermes Browser] Bot session open failed, creating local fallback:', err);
-    await createHermesBrowserSession({ title: BOT_CHAT_TITLE, hidden: true, focus: true, transport: 'rest', source: 'hermes_bot_mode' }).catch(() => null);
+    console.warn('[Hermes Browser] Bot session open failed; preserving canonical identity:', err);
+    setStatus('error', 'Could not open Bot Chat', err?.message || String(err), { translateDetail: false });
     return false;
   } finally {
     if (els.botModeLoadingOverlay) els.botModeLoadingOverlay.hidden = true;
@@ -9101,8 +10152,15 @@ async function leaveBotModeForRegularSession() {
     activeGroupExpandedThreads.clear();
     resetActiveGroupTypingIndicator();
     botHistoryVisibleCount = BOT_HISTORY_PAGE_SIZE;
-    activeConversationTransport = 'rest';
-    activeDashboardWsConnection = null;
+    // If we're connected to a local Desktop dashboard runtime, keep the dashboard-ws transport active
+    // so regular sessions don't revert to unconfigured local-api REST and trigger a disconnect.
+    if (desktopDashboardUrl) {
+      activeConversationTransport = 'dashboard-ws';
+      activeDashboardWsConnection = profileWsConnection || null;
+    } else {
+      activeConversationTransport = 'rest';
+      activeDashboardWsConnection = null;
+    }
     activeSessionRuntime = {
       ...activeSessionRuntime,
       sessionId: '',
@@ -9142,6 +10200,7 @@ async function leaveBotModeForRegularSession() {
     renderMessagesFromStorage();
     renderActiveProfileIndicator();
     updateSessionLabel();
+    updateConnectionPrompt();
     setStatus('ok', 'Regular Sessions restored', `Started a fresh Hermes Browser session for ${profileSwitchDisplayName(nextProfile)}.`, { translateDetail: false });
     return true;
   } finally {
@@ -10901,7 +11960,8 @@ function makeBrowserSessionTitle(date = new Date()) {
   return `Hermes Browser Extension · ${stamp}`;
 }
 
-async function beginHermesBrowserDraft({ title = makeBrowserSessionTitle(), focus = true } = {}) {
+async function beginHermesBrowserDraft({ title = makeBrowserSessionTitle(), focus = true, scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   if (!canSwitchActiveSession({ sending, runControl: activeRunControl })) {
     setStatus('warn', 'Hermes is working…', 'Stop the active run before switching sessions.');
     return false;
@@ -10910,9 +11970,8 @@ async function beginHermesBrowserDraft({ title = makeBrowserSessionTitle(), focu
   // must use that profile-aware transport even when the extension itself is
   // connected to the local API sidecar; otherwise the first send can land on
   // the default profile or fail before the profile WS fallback is reached.
-  if (isRemoteWsMode()) return createHermesBrowserSession({ title, focus });
-  if (isNamedHermesProfile()) {
-    return createHermesBrowserSession({ title, focus, transport: 'dashboard-ws' });
+  if (isRemoteWsMode() || isNamedHermesProfile() || activeConversationTransport === 'dashboard-ws') {
+    return createHermesBrowserSession({ title, focus, transport: 'dashboard-ws', scopeRevisionId });
   }
   const sessionId = makeBrowserSessionId();
   const preferredBinding = preferredModelBindingForNewSession();
@@ -10933,7 +11992,9 @@ async function beginHermesBrowserDraft({ title = makeBrowserSessionTitle(), focu
   sessionRoutesAvailable = true;
   messages = [];
   await browserApi.storage.local.set({ hermesBrowserSettings: settings, [activeMessagesStorageKey(previousConversationScope)]: [] });
-  await saveSessionBindingForActiveScope({ id: sessionId, title, source: DEFAULT_SETTINGS.sessionSource });
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+  await saveSessionBindingForActiveScope({ id: sessionId, title, source: DEFAULT_SETTINGS.sessionSource }, { scopeRevisionId });
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   renderMessagesFromStorage();
   updateSessionLabel();
   renderSessionMenu();
@@ -10949,7 +12010,8 @@ function preferredModelOptionsForNewSession() {
   });
 }
 
-async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), focus = true, hidden = false, transport = '', source = '' } = {}) {
+async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), focus = true, hidden = false, transport = '', source = '', scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   activeGroupAbortController?.abort?.();
   activeGroupAbortController = null;
   activeGroupProjection = null;
@@ -10962,16 +12024,19 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
   const requestProvider = preferredModel?.provider || preferredBinding?.provider || '';
   const dashboardTransport = activeConversationTransport === 'dashboard-ws'
     || shouldUseBotDashboardTransport({ gatewayMode: settings.gatewayMode, transport });
+  let connection = null;
   if (dashboardTransport) {
     activeConversationTransport = 'dashboard-ws';
     try {
-      const connection = await ensureActiveDashboardWsConnection();
+      connection = await ensureActiveDashboardWsConnection();
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
       const { liveId, storedId } = await establishGatewaySession({
         client: connection.client,
         profile: safeActiveProfile(),
         createParams: {
           title,
           hidden,
+          ...(source === 'hermes_bot_mode' ? { follow_profile_config: true } : {}),
           source: source || settings.sessionSource || DEFAULT_SETTINGS.sessionSource,
           model: requestModel,
           provider: requestProvider || undefined,
@@ -10980,6 +12045,7 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
           profile: safeActiveProfile(),
         },
       });
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
       connection.wsSessionId = liveId;
       connection.wsStoredSessionId = storedId;
       connection.profile = safeActiveProfile();
@@ -11018,18 +12084,31 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
       activeSessionRuntime = { ...activeSessionRuntime, sessionId: id, usedTokens: 0, inputTokens: 0, outputTokens: 0, model: '', provider: '', source: '' };
       messages = [];
       await browserApi.storage.local.set({ hermesBrowserSettings: settings, [activeMessagesStorageKey(previousConversationScope)]: [] });
-      await saveSessionBindingForActiveScope(session);
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+      await saveSessionBindingForActiveScope(session, { scopeRevisionId });
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
       renderMessagesFromStorage();
       updateSessionLabel();
       renderSessionMenu();
       if (focus) els.input.focus();
       return session;
     } catch (wsError) {
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+      const preserveDashboardTransport = shouldPreserveDashboardTransport({
+        requestedTransport: 'dashboard-ws',
+        connectionReadyState: connection?.client?.readyState || activeDashboardWsConnection?.client?.readyState,
+        error: wsError,
+      });
+      if (source === 'hermes_bot_mode' || preserveDashboardTransport || isRemoteWsMode()) {
+        console.warn('[Hermes Browser] dashboard-ws session creation failed; preserving the active transport:', wsError?.message || wsError);
+        throw wsError;
+      }
       console.warn('[Hermes Browser] dashboard-ws session creation fell back to REST:', wsError?.message || wsError);
+      activeConversationTransport = 'rest';
+      activeDashboardWsConnection = null;
     }
   }
-  activeConversationTransport = 'rest';
-  activeDashboardWsConnection = null;
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   const sessionId = makeBrowserSessionId();
   const response = await apiFetch('/api/sessions', {
     method: 'POST',
@@ -11045,6 +12124,7 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
     }),
   });
   const payload = await readJsonResponse(response);
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   if (!response.ok) throw new Error(payload?.error?.message || payload?.error || `Could not create session (${response.status})`);
   const session = normalizeHermesSessions({ data: [{
     ...(payload.session || payload),
@@ -11074,7 +12154,9 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
   sessionRoutesAvailable = true;
   messages = [];
   await browserApi.storage.local.set({ hermesBrowserSettings: settings, [activeMessagesStorageKey(previousConversationScope)]: [] });
-  await saveSessionBindingForActiveScope(session);
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+  await saveSessionBindingForActiveScope(session, { scopeRevisionId });
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   renderMessagesFromStorage();
   updateSessionLabel();
   renderSessionMenu();
@@ -11084,7 +12166,7 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
 
 function renderSessionHistoryLoading(session = {}) {
   const loading = document.createElement('section');
-  loading.className = 'session-history-loading';
+  loading.className = 'bot-mode-loading-overlay';
   loading.setAttribute('role', 'status');
   loading.setAttribute('aria-live', 'polite');
 
@@ -11092,22 +12174,31 @@ function renderSessionHistoryLoading(session = {}) {
   rail.className = 'session-history-loading-rail';
   rail.setAttribute('aria-hidden', 'true');
 
-  const label = document.createElement('span');
-  label.className = 'session-history-loading-label';
-  label.textContent = translateUiText('OPENING SESSION');
+  const card = document.createElement('div');
+  card.className = 'bot-mode-loading-card';
+  const avatar = document.createElement('span');
+  avatar.className = 'bot-mode-avatar bot-mode-avatar-loading';
+  avatar.setAttribute('aria-hidden', 'true');
+  const icon = document.createElement('img');
+  icon.src = 'assets/icons/icon-48.png';
+  icon.alt = '';
+  avatar.append(icon);
 
   const title = document.createElement('strong');
-  title.textContent = sessionDisplayName(session);
+  title.textContent = translateUiText('OPENING SESSION');
 
   const detail = document.createElement('span');
-  detail.className = 'session-history-loading-detail';
-  detail.textContent = translateUiText('Loading canonical Hermes history…');
+  detail.className = 'hint';
+  detail.textContent = sessionDisplayName(session);
 
-  loading.append(rail, label, title, detail);
+  card.append(avatar, rail, title, detail);
+  loading.append(card);
   els.messages.replaceChildren(loading);
 }
 
 async function openHermesSession(selectedSession) {
+  const { scopeRevisionId = scopeRevision.current() } = arguments[1] || {};
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   if (!canSwitchActiveSession({ sending, runControl: activeRunControl })) {
     setStatus('warn', 'Hermes is working…', 'Stop the active run before switching sessions.');
     return false;
@@ -11120,6 +12211,10 @@ async function openHermesSession(selectedSession) {
   els.sessionMenu.hidden = true;
   els.sessionMenuButton.setAttribute('aria-expanded', 'false');
   const requestId = ++sessionLoadRequestId;
+  const isCurrentRequest = () => {
+    if (requestId !== sessionLoadRequestId) return;
+    return scopeRevision.isCurrent(scopeRevisionId);
+  };
   let session = selectedSession;
   renderSessionHistoryLoading(session);
   const requestedSessionId = session.id;
@@ -11141,7 +12236,7 @@ async function openHermesSession(selectedSession) {
         storedSessionId: session.id,
         profile: safeActiveProfile(),
       });
-      if (requestId !== sessionLoadRequestId) return;
+      if (!isCurrentRequest()) return false;
       // Profile boundary check: a session that the gateway reports under a
       // different profile must not be resumed into the current selection. Fail
       // closed and refuse to bind it (issue #60 review).
@@ -11153,7 +12248,7 @@ async function openHermesSession(selectedSession) {
           `This session belongs to the "${reportedProfile}" profile. Switch to that profile before resuming it.`,
           { translateDetail: false },
         );
-        return;
+        return false;
       }
       connection.wsSessionId = liveId;
       connection.wsStoredSessionId = storedId;
@@ -11171,16 +12266,21 @@ async function openHermesSession(selectedSession) {
         },
       };
     } catch (error) {
-      if (requestId !== sessionLoadRequestId) return;
-      if (!isRemoteWsMode()) {
+      if (!isCurrentRequest()) return false;
+      if (!shouldPreserveDashboardTransport({
+        requestedTransport: 'dashboard-ws',
+        connectionReadyState: activeDashboardWsConnection?.client?.readyState,
+        error,
+      }) && !isRemoteWsMode()) {
         activeConversationTransport = 'rest';
         activeDashboardWsConnection = null;
       }
       renderMessagesFromStorage();
       setStatus('error', 'Could not open session', error?.message || String(error), { translateDetail: false });
-      return;
+      return false;
     }
   }
+  if (!isCurrentRequest()) return false;
   const inheritedModelBinding = settings.sessionModelBindings?.[requestedSessionId];
   const inheritedModelOptions = settings.sessionModelOptionBindings?.[requestedSessionId];
   settings = {
@@ -11200,16 +12300,20 @@ async function openHermesSession(selectedSession) {
   activeSessionRuntime = { ...activeSessionRuntime, sessionId: session.id, usedTokens: 0, inputTokens: 0, outputTokens: 0, model: '', provider: '', source: '' };
   sessionRoutesAvailable = true;
   await browserApi.storage.local.set({ hermesBrowserSettings: settings });
-  await saveSessionBindingForActiveScope(session);
+  if (!isCurrentRequest()) return false;
+  await saveSessionBindingForActiveScope(session, { scopeRevisionId });
+  if (!isCurrentRequest()) return false;
   await activateCurrentDelegationSession();
+  if (!isCurrentRequest()) return false;
   updateSessionLabel();
   renderSessionMenu();
   const loaded = await loadSessionMessages(liveSessionId, {
     requestId,
+    scopeRevisionId,
     transport: activeConversationTransport,
     connection: activeDashboardWsConnection,
   });
-  if (requestId !== sessionLoadRequestId) return;
+  if (!isCurrentRequest()) return false;
   setStatus(loaded ? 'ok' : 'warn', loaded ? 'Session opened' : 'Session opened without history', `${session.sourceLabel || session.source || 'Hermes'} · ${session.id}`, { translateDetail: false });
   return true;
 }
@@ -11255,7 +12359,128 @@ async function fetchSessionMessagesQuietly(sessionId, {
   };
 }
 
-async function commitFetchedSessionMessages(result, { sessionId, requestId = null } = {}) {
+// Dashboard history for background reconciliation (delegation watches, post-turn
+// refresh, subagent settle). The gateway reaps detached runtimes: a history call
+// against a stale live id is rejected with "not in memory", and the documented
+// contract is resume-then-history. Try the socket's live id when it belongs to
+// the requested durable session, then the durable id, then resume the durable
+// session to mint a fresh live id and fetch again.
+async function fetchDashboardHistoryWithResume(durableSessionId = '') {
+  const sid = String(durableSessionId || settings.sessionId || '').trim();
+  if (!sid) throw new Error('A durable session id is required for history.');
+  const connection = await ensureActiveDashboardWsConnection();
+  if (connection?.client?.readyState !== 1) throw new Error('Hermes dashboard is not connected.');
+  const live = String(connection.wsSessionId || '').trim();
+  const liveBelongsToSession = Boolean(live) && String(connection.wsStoredSessionId || '').trim() === sid;
+  const candidates = liveBelongsToSession && live !== sid ? [live, sid] : [sid];
+  for (const candidate of candidates) {
+    try {
+      return await fetchSessionMessagesQuietly(candidate, { transport: 'dashboard-ws', connection });
+    } catch {
+      // Reaped/detached runtime — try the next candidate, then resume below.
+    }
+  }
+  const { liveId } = await establishGatewaySession({
+    client: connection.client,
+    storedSessionId: sid,
+    profile: safeActiveProfile(),
+  });
+  connection.wsSessionId = liveId;
+  connection.wsStoredSessionId = sid;
+  connection.profile = safeActiveProfile();
+  return fetchSessionMessagesQuietly(liveId, { transport: 'dashboard-ws', connection });
+}
+
+async function resolveDashboardMediaBaseUrl() {
+  return resolveDashboardTranscriptionBaseUrl({
+    desktopDashboardUrl,
+    gatewayMode: normalizeGatewayMode(settings.gatewayMode),
+    gatewayUrl: settings.gatewayUrl,
+    discover: () => ensureDesktopDashboardUrl({ timeoutMs: 2_500 }),
+  });
+}
+
+async function hydrateSessionMedia(messageList = []) {
+  const rows = Array.isArray(messageList) ? messageList : [];
+  const pending = [];
+  for (const message of rows) {
+    const extracted = extractHistoryMediaAttachments(message);
+    if (extracted.length && !normalizeUserImageAttachments(message.attachments).length) {
+      message.attachments = [...(Array.isArray(message.attachments) ? message.attachments : []), ...extracted];
+    }
+    if (!Array.isArray(message?.attachments)) continue;
+    for (const attachment of message.attachments) {
+      if (!attachment || attachment.dataUrl || !attachment.pathRef) continue;
+      const plan = resolveMediaFetchPlan({ pathRef: attachment.pathRef });
+      if (plan.transport !== 'dashboard-media') continue;
+      pending.push(attachment);
+    }
+  }
+  if (!pending.length) return;
+  const baseUrl = await resolveDashboardMediaBaseUrl();
+  if (!baseUrl) return;
+  const token = await fetchDashboardSessionToken({ baseUrl });
+  await Promise.all(pending.map(async (attachment) => {
+    const dataUrl = await fetchDashboardMediaDataUrl({
+      baseUrl,
+      filePath: attachment.pathRef,
+      token,
+    });
+    if (dataUrl) attachment.dataUrl = dataUrl;
+  }));
+}
+
+async function hydrateSessionMediaInElement(element) {
+  if (!element?.querySelectorAll) return;
+  const nodes = [...element.querySelectorAll('[data-session-media][data-media-path]')];
+  if (!nodes.length) return;
+  const baseUrl = await resolveDashboardMediaBaseUrl();
+  if (!baseUrl) {
+    for (const node of nodes) node.classList.add('unavailable');
+    return;
+  }
+  const token = await fetchDashboardSessionToken({ baseUrl });
+  const doc = element.ownerDocument || document;
+  await Promise.all(nodes.map(async (node) => {
+    if (!node.isConnected) return;
+    const filePath = node.getAttribute('data-media-path') || '';
+    const kind = node.getAttribute('data-session-media') || classifyMediaKind(filePath);
+    const plan = resolveMediaFetchPlan({ pathRef: filePath });
+    if (kind === 'image' && plan.transport === 'dashboard-media') {
+      const dataUrl = await fetchDashboardMediaDataUrl({ baseUrl, filePath, token });
+      if (!dataUrl) {
+        node.classList.add('unavailable');
+        return;
+      }
+      const figure = doc.createElement('figure');
+      figure.className = 'generated-image';
+      figure.dataset.slot = 'aui_generated-image';
+      const image = doc.createElement('img');
+      image.src = dataUrl;
+      image.alt = filePath.split(/[\\/]/).pop() || 'Image';
+      image.loading = 'lazy';
+      image.dataset.slot = 'aui_generated-image';
+      figure.append(image);
+      node.replaceWith(figure);
+      return;
+    }
+    if (kind === 'video' && plan.transport === 'dashboard-stream') {
+      const video = doc.createElement('video');
+      video.className = 'session-media-player';
+      video.controls = true;
+      video.preload = 'metadata';
+      video.src = dashboardFileStreamUrl(baseUrl, filePath, token);
+      video.addEventListener('error', () => {
+        node.classList.add('unavailable');
+        if (video.isConnected) video.replaceWith(node);
+      }, { once: true });
+      node.replaceWith(video);
+    }
+  }));
+}
+
+async function commitFetchedSessionMessages(result, { sessionId, requestId = null, scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   if (requestId != null && requestId !== sessionLoadRequestId) return false;
   if (String(settings.sessionId || '').trim() !== String(sessionId || '').trim()) return false;
   if (result?.session) applySessionRuntimeSnapshot({
@@ -11264,34 +12489,97 @@ async function commitFetchedSessionMessages(result, { sessionId, requestId = nul
     source: 'Hermes session',
   });
   const contextMessages = Array.isArray(result?.contextMessages) ? result.contextMessages : [];
-  messages = Array.isArray(result?.messages) ? result.messages : [];
+  const incoming = Array.isArray(result?.messages) ? result.messages : [];
+  messages = preserveUserImageAttachments(incoming, messages).map((message) => {
+    const extracted = extractHistoryMediaAttachments(message);
+    if (!extracted.length || normalizeUserImageAttachments(message.attachments).length) return message;
+    return { ...message, attachments: extracted };
+  });
+  // A steered message that reached the transcript clears its queued row —
+  // the dashed placeholder must not outlive the real message.
+  if (pendingSteerText && messages.some((message) => message?.role === 'user' && String(message.content || '').includes(pendingSteerText))) {
+    pendingSteerText = '';
+  }
   loadedSessionContextEstimate = {
     sessionId,
     contextTokens: estimateLocalSessionContextTokens({ messages: contextMessages }),
     visibleTokens: estimateLocalSessionContextTokens({ messages: browserDisplayMessages(messages) }),
   };
-  await saveMessagesForActiveScope();
+  await saveMessagesForActiveScope({ scopeRevisionId });
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   if (requestId != null && requestId !== sessionLoadRequestId) return false;
   if (String(settings.sessionId || '').trim() !== String(sessionId || '').trim()) return false;
+  await hydrateSessionMedia(messages);
   renderMessagesFromStorage();
   return true;
 }
 
+let completionRevealSequence = 0;
+
+// Async delegation completions arrive through history reconciliation — there is
+// no live token stream attached — so a plain commit made the finished reply pop
+// in fully formed. Detect the new trailing reply, commit the transcript, then
+// reveal that message with the same progressive renderer live turns use.
+async function commitFetchedSessionMessagesWithReveal(result, options = {}) {
+  const reply = newestAssistantReply(trailingNewMessages(messages, result?.messages));
+  const committed = await commitFetchedSessionMessages(result, options);
+  if (!committed || !reply || document.hidden) return committed;
+  // Transient rows (completion thinking, queued steer) also carry .assistant
+  // styling and sit at the tail — never let them steal the reveal target.
+  const nodes = [...els.messages.querySelectorAll('.message.assistant')]
+    .filter((row) => !row.classList.contains('completion-pending-row') && !row.classList.contains('steer-pending-row'));
+  const node = nodes.length ? nodes[nodes.length - 1] : null;
+  if (node) revealCompletionReply(node, reply);
+  return committed;
+}
+
+function revealCompletionReply(node, fullText) {
+  // Reveal the same display text the committed renderer used (media echoes and
+  // role styling live outside this passthrough), so the tail matches exactly.
+  const text = String(messageDisplayText('assistant', fullText) || '');
+  const plan = completionRevealPlan(text);
+  if (!text || !plan.total) return;
+  const token = ++completionRevealSequence;
+  const updater = createStreamingMessageUpdater(node);
+  setMessageContent(node, revealSlice(text, plan.initialCount));
+  const startedAt = performance.now();
+  const step = (now) => {
+    if (token !== completionRevealSequence || !node.isConnected || sending) {
+      // Superseded, detached, or a new live turn started — show the full reply.
+      updater.flush(text);
+      return;
+    }
+    const progress = Math.min(1, (now - startedAt) / plan.durationMs);
+    if (progress >= 1) {
+      updater.flush(text);
+      return;
+    }
+    const eased = 1 - Math.pow(1 - progress, 2.4);
+    updater.updateText(revealSlice(text, Math.max(1, Math.floor(plan.total * eased))));
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 async function loadSessionMessages(sessionId = settings.sessionId, {
   requestId = null,
+  scopeRevisionId = scopeRevision.current(),
   transport = usesDashboardWsChatTransport() ? 'dashboard-ws' : 'rest',
   connection = activeDashboardWsConnection,
 } = {}) {
   const expectedSessionId = String(settings.sessionId || '').trim();
-  const isCurrentRequest = () => requestId == null || requestId === sessionLoadRequestId;
+  const isCurrentRequest = () => (requestId == null || requestId === sessionLoadRequestId)
+    && scopeRevision.isCurrent(scopeRevisionId);
+  if (!isCurrentRequest()) return false;
   if (isUnsavedBrowserDraftSession({ sessionId, sessions: availableSessions })) {
+    if (!isCurrentRequest()) return false;
     await loadMessagesForActiveScope();
     return true;
   }
   try {
     const result = await fetchSessionMessagesQuietly(sessionId, { transport, connection: activeDashboardWsConnection || connection });
     if (!isCurrentRequest()) return false;
-    return commitFetchedSessionMessages(result, { sessionId: expectedSessionId, requestId });
+    return commitFetchedSessionMessages(result, { sessionId: expectedSessionId, requestId, scopeRevisionId });
   } catch (error) {
     if (!isCurrentRequest()) return false;
     addMessage('system', `Could not load session messages: ${error?.message || String(error)}`);
@@ -11309,7 +12597,9 @@ async function refreshActiveSessionHistoryQuietly(expectedGeneration = runContro
   if (!sessionId || sending || activeGroupProjection) return false;
   if (isUnsavedBrowserDraftSession({ sessionId, sessions: availableSessions })) return false;
   try {
-    const result = await fetchSessionMessagesQuietly(sessionId);
+    const result = usesDashboardWsChatTransport()
+      ? await fetchDashboardHistoryWithResume(sessionId)
+      : await fetchSessionMessagesQuietly(sessionId);
     if (!runControlGenerationMatches(expectedGeneration, runControlGeneration)) return false;
     if (String(settings.sessionId || '').trim() !== sessionId || sending || activeGroupProjection) return false;
     if (messages.length > 0 && (!Array.isArray(result?.messages) || result.messages.length === 0)) return false;
@@ -11441,10 +12731,11 @@ async function handleSessionOwnershipDecision(event) {
   }
 }
 
-async function ensureDefaultBrowserSession({ focus = false } = {}) {
-  if ((!settings.apiKey && !usesDashboardWsChatTransport()) || settings.sessionId !== DEFAULT_SETTINGS.sessionId) return;
+async function ensureDefaultBrowserSession({ focus = false, scopeRevisionId = scopeRevision.current() } = {}) {
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
+  if ((!settings.apiKey && !usesDashboardWsChatTransport()) || settings.sessionId !== DEFAULT_SETTINGS.sessionId) return false;
   const current = availableSessions.find((session) => session.id === settings.sessionId);
-  if (isHermesBrowserSession(current)) return;
+  if (isHermesBrowserSession(current)) return true;
   if (current) {
     try {
       const response = await apiFetch(`/api/sessions/${encodeSessionId(current.id)}`, {
@@ -11452,24 +12743,28 @@ async function ensureDefaultBrowserSession({ focus = false } = {}) {
         body: JSON.stringify({ source: DEFAULT_SETTINGS.sessionSource }),
       });
       const payload = await readJsonResponse(response);
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
       if (!response.ok) throw new Error(payload?.error?.message || payload?.error || `Session migration failed (${response.status})`);
       const migrated = normalizeHermesSessions({ data: [payload.session || payload] })[0];
       if (migrated) {
         availableSessions = normalizeHermesSessions({ data: [migrated, ...availableSessions.filter((item) => item.id !== migrated.id)] });
         updateSessionLabel();
         renderSessionMenu();
-        return;
+        return true;
       }
     } catch (error) {
+      if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
       setStatus('warn', 'Could not migrate Browser session', error?.message || String(error), { translateDetail: false });
     }
   }
+  if (!scopeRevision.isCurrent(scopeRevisionId)) return false;
   const existingBrowserSession = availableSessions.find(isHermesBrowserSession);
   if (existingBrowserSession) {
-    await openHermesSession(existingBrowserSession);
-    return;
+    await openHermesSession(existingBrowserSession, { scopeRevisionId });
+    return scopeRevision.isCurrent(scopeRevisionId);
   }
-  await beginHermesBrowserDraft({ title: makeBrowserSessionTitle(), focus });
+  await beginHermesBrowserDraft({ title: makeBrowserSessionTitle(), focus, scopeRevisionId });
+  return scopeRevision.isCurrent(scopeRevisionId);
 }
 
 const THINKING_PLACEHOLDER = 'Hermes is thinking...';
@@ -11516,6 +12811,15 @@ function patchRenderedMessageContent(element, html = '') {
     }
     if (live.nodeType === Node.ELEMENT_NODE && next.nodeType === Node.ELEMENT_NODE) {
       if (live.outerHTML === next.outerHTML) { stable += 1; continue; }
+      if (
+        live.tagName === next.tagName
+        && stable === incoming.length - 1
+        && stable === existing.length - 1
+      ) {
+        if (live.innerHTML !== next.innerHTML) live.innerHTML = next.innerHTML;
+        stable += 1;
+        continue;
+      }
       break;
     }
     break;
@@ -11531,9 +12835,11 @@ function renderMessageContentElement(element, content = '') {
     renderThinkingIndicator(element);
     return;
   }
-  // Prefix-stable patch (see patchRenderedMessageContent): completed blocks in
-  // a streaming bubble are never rebuilt, so cards stop jumping mid-generation.
   patchRenderedMessageContent(element, renderMarkdownSafe(content || ''));
+  enhanceMarkdownCodeBlocks(element, {
+    copyLabel: translateUiText('Copy code'),
+    copiedLabel: translateUiText('Copied'),
+  });
   for (const image of element.querySelectorAll('img[data-slot="aui_generated-image"]:not([data-inspect-wrapped])')) {
     image.dataset.inspectWrapped = 'true';
     const wrapper = document.createElement('span');
@@ -11553,6 +12859,7 @@ function renderMessageContentElement(element, content = '') {
       openGeneratedImageLightbox(image);
     });
   }
+  void hydrateSessionMediaInElement(element);
 }
 
 function closeGeneratedImageLightbox() {
@@ -11928,13 +13235,18 @@ function assistantMessageRoleLabel() {
   return botProfileDisplayName(row).toUpperCase();
 }
 
-function addMessage(role, content, { persist = true, roleLabel = '', contextReceipt = null } = {}) {
+function addMessage(role, content, { persist = true, roleLabel = '', contextReceipt = null, attachments = null } = {}) {
   if (!messages.length) els.messages.innerHTML = '';
   const node = els.template.content.firstElementChild.cloneNode(true);
   node.classList.add(role);
   node.querySelector('.message-role').textContent = roleLabel || (role === 'assistant' ? assistantMessageRoleLabel() : role);
   renderMessageContentElement(node.querySelector('.message-content'), messageDisplayText(role, content || ''));
   if (contextReceipt && contextReceipt?.items?.length) appendContextReceipt(node, contextReceipt);
+  if (role === 'user') {
+    appendUserImageAttachments(node.querySelector('.message-content'), attachments, {
+      onOpen: (image) => openGeneratedImageLightbox(image),
+    });
+  }
   els.messages.appendChild(node);
   scrollMessageStreamToBottom({ force: true });
   // The "What Hermes saw" receipt rides on the stored row so history replays
@@ -11942,6 +13254,7 @@ function addMessage(role, content, { persist = true, roleLabel = '', contextRece
   const record = { role, content: content || '', ts: Date.now() };
   if (roleLabel) record.roleLabel = roleLabel;
   if (contextReceipt && contextReceipt?.items?.length) record.contextReceipt = contextReceipt;
+  if (Array.isArray(attachments) && attachments.length) record.attachments = attachments;
   if (persist) {
     messages.push(record);
     trimAndSaveMessages();
@@ -11997,12 +13310,15 @@ function createStreamingMessageUpdater(node) {
     if (!renderedRecoveredImage || imageSource) setToolActivity(node, null);
     setMessageContent(node, pending);
   };
+  const paintStream = () => {
+    setMessageContent(node, pending || THINKING_PLACEHOLDER);
+  };
   const updateText = (content = '') => {
     pending = content || '';
     if (frame) return;
     frame = requestAnimationFrame(() => {
       frame = 0;
-      setMessageContent(node, pending || THINKING_PLACEHOLDER);
+      paintStream();
     });
   };
   function updateTool(tool = null) {
@@ -12013,7 +13329,13 @@ function createStreamingMessageUpdater(node) {
     // tool-activity slot so the placeholder cannot keep animating after the turn.
     setToolActivity(node, null);
   }
-  return { update: updateText, updateText, updateTool, flush, dispose };
+  return {
+    update: updateText,
+    updateText,
+    updateTool,
+    flush,
+    dispose,
+  };
 }
 
 async function persistInlineSessionState() {
@@ -12155,6 +13477,7 @@ async function loadSettings({ restoreMessages = false } = {}) {
   renderMessagesFromStorage();
   hbeBootEmit('panel:messages-painted', { startMark: 'panel:body-start' });
   renderTaskStack();
+  restoreComposerDraft();
 }
 
 function renderMessagesFromStorage() {
@@ -12179,10 +13502,27 @@ function renderMessagesFromStorage() {
   }
   for (const message of browserDisplayMessages(visibleMessages)) {
     if (isDelegationCompletionMarkerMessage(message)) continue;
-    addMessage(message.role, message.content, { persist: false, roleLabel: message.roleLabel || '', contextReceipt: message.contextReceipt || null });
+    addMessage(message.role, message.content, {
+      persist: false,
+      roleLabel: message.roleLabel || '',
+      contextReceipt: message.contextReceipt || null,
+      attachments: message.attachments || null,
+    });
   }
   renderEmptyState();
   renderActiveProfileIndicator();
+  renderSteerNotice();
+  renderCompletionPendingRow();
+  const alreadyHydrated = messages.some((message) => (message.attachments || []).some((item) => item.dataUrl && item.pathRef));
+  void (async () => {
+    await hydrateSessionMedia(messages);
+    const nowHydrated = messages.some((message) => (message.attachments || []).some((item) => item.dataUrl && item.pathRef));
+    if (nowHydrated && !alreadyHydrated) {
+      renderMessagesFromStorage();
+      return;
+    }
+    await hydrateSessionMediaInElement(els.messages);
+  })();
 }
 
 function syncSettingsForm() {
@@ -12378,9 +13718,19 @@ async function clearStoredToken() {
   await browserApi.storage.local.set({ hermesBrowserSettings: settings });
   if (els.apiKeyInput) els.apiKeyInput.value = '';
   sessionRoutesAvailable = null;
+  desktopDashboardUrl = '';
+  await clearCachedRosterUrl(browserApi.storage.local).catch(() => undefined);
+  connectionController.cancel('stored token cleared');
+  try { remoteWsConnection?.client?.close?.(); } catch { /* ignore */ }
+  remoteWsConnection = null;
+  try { profileWsConnection?.client?.close?.(); } catch { /* ignore */ }
+  profileWsConnection = null;
+  activeDashboardWsConnection = null;
+  activeConversationTransport = 'rest';
+  await browserControlMessage('HERMES_CONTROLLER_SETTINGS_REFRESH').catch(() => null);
   const dashboardFallback = settings.connectionTransport === CONNECTION_TRANSPORTS.REMOTE_DASHBOARD
     && previousTransport !== CONNECTION_TRANSPORTS.REMOTE_DASHBOARD;
-  markConnectionProbe(dashboardFallback ? 'connecting' : 'unconfigured', 'Token cleared by user.');
+  markConnectionProbe('unconfigured', 'Token cleared by user.');
   setGatewayCapabilities(normalizeGatewayCapabilities(null, { healthOk: false, hasApiKey: false, warning: 'Token cleared; reconnect to refresh capabilities.' }));
   syncSettingsForm();
   setStatus(
@@ -12390,7 +13740,7 @@ async function clearStoredToken() {
       ? 'Remote dashboard WebSocket mode selected. Keep the dashboard open and signed in, then reconnect.'
       : 'Paste a Gateway API key or reconnect when you are ready.',
   );
-  if (dashboardFallback) await runPanelConnectionReadiness();
+  updateConnectionPrompt();
 }
 
 async function activeTab() {
@@ -12629,6 +13979,38 @@ async function loadElementPickState() {
   }
 }
 
+async function loadPageAnnotationState() {
+  const tab = annotationTargetTab();
+  if (!tab?.id) return;
+  const restored = await restorePageAnnotationSession({
+    storageArea: browserApi.storage?.session,
+    images: pageAnnotationImages,
+    tabId: tab.id,
+    safeUrl: tab.url,
+    documentKey: pageAnnotationSession?.documentKey || '',
+  }).catch(() => null);
+  if (!restored?.session) return;
+  pageAnnotationSession = {
+    sessionId: restored.session.sessionId,
+    tabId: restored.session.tabId,
+    safeUrl: restored.session.safeUrl,
+    documentKey: restored.session.documentKey,
+  };
+  pageAnnotationStack = {
+    ...emptyPageAnnotationStack(pageAnnotationSession),
+    nextNumber: restored.session.nextNumber || 1,
+    pins: restored.session.pins || [],
+  };
+  pageAnnotationStale = restored.status === 'stale';
+  for (const pin of pageAnnotationStack.pins) {
+    if (!pin.imageDataUrl && pin.imageRef) {
+      const stored = await pageAnnotationImages.get(pin.imageRef);
+      if (typeof stored === 'string') pin.imageDataUrl = stored;
+    }
+  }
+  renderPageAnnotationPanel();
+}
+
 async function clearElementPickState({ tabId = null } = {}) {
   if (tabId && elementPickState?.tabId && !Object.is(Number(tabId), elementPickState.tabId)) return;
   applyElementPickState(null);
@@ -12700,9 +14082,11 @@ function setPickButtonState() {
   }
 }
 
-async function startElementPick() {
+async function startElementPick({ purpose = 'context' } = {}) {
   if (contextScope.mode === CONTEXT_SCOPE_MODES.CHAT_ONLY) {
-    setStatus('warn', 'Chat only', 'Enable browser context before picking an element.');
+    setStatus('warn', 'Chat only', purpose === 'comment'
+      ? 'Enable browser context before commenting on the page.'
+      : 'Enable browser context before picking an element.');
     return;
   }
   const [active, tabs] = await Promise.all([activeTab(), tabsForCurrentScope()]);
@@ -12712,27 +14096,46 @@ async function startElementPick() {
     return;
   }
   if (isRestrictedUrl(tab.url)) {
-    setStatus('warn', 'Restricted page', 'Element pick is not available on this URL.');
+    setStatus('warn', 'Restricted page', purpose === 'comment'
+      ? 'Page comments are not available on this URL.'
+      : 'Element pick is not available on this URL.');
     return;
   }
   try {
     if (elementPickActiveForTab(tab)) {
       await browserApi.tabs.sendMessage(tab.id, { type: ELEMENT_PICK_MESSAGES.CANCEL });
       await clearElementPickState({ tabId: tab.id });
-      setStatus('ok', 'Element pick cancelled', '');
+      pageCommentPickActive = false;
+      setStatus('ok', purpose === 'comment' ? 'Page comments cancelled' : 'Element pick cancelled', '');
       return;
     }
-    const response = await sendContentMessageWithInstallFallback(tab.id, { type: ELEMENT_PICK_MESSAGES.START });
+    pageCommentPickActive = purpose === 'comment';
+    const commentPick = pageCommentPickActive;
+    const response = await sendContentMessageWithInstallFallback(tab.id, {
+      type: ELEMENT_PICK_MESSAGES.START,
+      purpose: commentPick ? 'comment' : 'context',
+      theme: pageCommentThemeFromPanel(),
+    });
     if (response?.ok === false) throw new Error(response.error || 'Could not start element picker');
     await persistElementPickState({ tabId: tab.id, url: tab.url });
-    setStatus('ok', 'Pick an element', 'Click any element on the page. Press Esc to cancel.');
+    setStatus(
+      'ok',
+      commentPick ? 'Comment on page' : 'Pick an element',
+      commentPick ? 'Click an element, then write a comment. Esc cancels.' : 'Click any element on the page. Press Esc to cancel.',
+    );
   } catch (error) {
+    const wasComment = pageCommentPickActive;
+    pageCommentPickActive = false;
     await clearElementPickState({ tabId: tab.id });
-    setStatus('warn', 'Element pick failed', error?.message || String(error), { translateDetail: false });
+    setStatus('warn', wasComment ? 'Page comments failed' : 'Element pick failed', error?.message || String(error), { translateDetail: false });
   }
 }
 
 function applyPickedElementResult(message = {}, sender = {}) {
+  if (pageCommentPickActive) {
+    void preparePageCommentFromPick(message, sender);
+    return;
+  }
   const tabId = sender.tab?.id || currentContext?.activeTab?.id;
   const pickedElement = message.pickedElement;
   if (!pickedElement?.ok) return;
@@ -12750,14 +14153,374 @@ function applyPickedElementResult(message = {}, sender = {}) {
   setStatus('ok', 'Element picked', label || 'Attached to context for the next message.');
 }
 
+async function preparePageCommentFromPick(message = {}, sender = {}) {
+  const picked = normalizePickedElement(message.pickedElement);
+  if (!picked) {
+    pageCommentPickActive = false;
+    return;
+  }
+  const tabId = sender.tab?.id || annotationTargetTab()?.id;
+  const tab = annotationTargetTab() || currentContext?.activeTab || sender.tab || null;
+  await clearElementPickState({ tabId });
+  pageAnnotationSession = {
+    sessionId: pageAnnotationSession?.sessionId || `page-annotation-${Date.now()}`,
+    tabId,
+    safeUrl: String(message.url || tab?.url || ''),
+    documentKey: pageAnnotationSession?.documentKey || '',
+  };
+  if (!pageAnnotationStack.sessionId) pageAnnotationStack = emptyPageAnnotationStack(pageAnnotationSession);
+  const rect = picked.boundingBox;
+  let imageDataUrl = '';
+  if (tab?.id && rect) {
+    const capture = await captureAnnotationCrop({
+      captureVisibleTab: async (target) => browserApi.tabs.captureVisibleTab(target.windowId || tab.windowId, { format: 'png' }),
+      tab: { ...tab, active: true, id: tab.id, windowId: tab.windowId },
+      rect,
+      viewport: { width: 1, height: 1, devicePixelRatio: 1 },
+      cropImage: cropAnnotationImage,
+    }).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+    if (capture?.ok) imageDataUrl = capture.dataUrl;
+    else if (capture && capture.ok === false) {
+      setStatus('warn', t('ui.comment.capture.unavailable'), capture?.reason || capture?.error || '', { translateDetail: false });
+    }
+  }
+  pageAnnotationDraft = {
+    kind: 'element',
+    rect,
+    viewport: { width: 1, height: 1, devicePixelRatio: 1 },
+    identity: compactPageAnnotationIdentity({
+      selector: picked.selector,
+      tag: picked.tag,
+      text: picked.text,
+      html: picked.outerHtml,
+    }),
+    target: { selector: picked.selector, tag: picked.tag, html: picked.outerHtml, text: picked.text },
+    imageDataUrl,
+    imageRef: `${pageAnnotationSession.sessionId}/annotation-${pageAnnotationStack.nextNumber}`,
+    note: '',
+  };
+}
+
+async function commitPageCommentFromCard(message = {}) {
+  const action = message.action === 'send' ? 'send' : 'queue';
+  if (!pageAnnotationDraft && message.pickedElement) {
+    await preparePageCommentFromPick(message, {});
+  }
+  if (!pageAnnotationDraft) return;
+  savePageAnnotationDraft(message.note);
+  renderPageCommentTray();
+  if (action === 'queue') {
+    await startElementPick({ purpose: 'comment' });
+    setStatus('ok', 'Comment queued', 'Click another element, or send comments from the composer.');
+    return;
+  }
+  pageCommentPickActive = false;
+  const userText = String(els.input?.value || '').trim();
+  if (sending) {
+    queuedTurn = queuePageAnnotationTurn(buildPageAnnotationComposerBundle({
+      ...pageAnnotationStack,
+      safeUrl: pageAnnotationSession?.safeUrl || pageAnnotationStack.safeUrl,
+      pins: pageAnnotationStack.pins || [],
+    }, { resolveImage: (pin) => pin.imageDataUrl }));
+    renderQueueNotice();
+    return;
+  }
+  await askHermes(userText, [...attachments]);
+}
+
+function cancelPageCommentCard() {
+  pageAnnotationDraft = null;
+  pageCommentPickActive = false;
+  renderPageAnnotationPanel();
+  setStatus('ok', 'Page comments closed', (pageAnnotationStack.pins || []).length ? 'Queued comments are still in the composer.' : 'Cancelled.');
+}
+
 function clearPickedElementForActiveTab() {
   clearPickedElementForTab(currentContext?.activeTab?.id);
 }
 
+function annotationCommentsEnabled() {
+  return pageAnnotationCommentsEnabled({});
+}
+
+function pageCommentThemeFromPanel() {
+  const computed = globalThis.getComputedStyle;
+  const styles = typeof computed === 'function' ? computed(document.documentElement) : null;
+  const body = typeof computed === 'function' && document.body ? computed(document.body) : null;
+  const read = (name, fallback) => String(styles?.getPropertyValue?.(name) || '').trim() || fallback;
+  return {
+    bg: read('--hermes-menu-bg', read('--hermes-paper', '#171717')),
+    field: read('--hermes-paper', '#111111'),
+    fg: read('--hermes-fg', '#f1f1f1'),
+    muted: read('--hermes-muted', 'rgba(241,241,241,0.62)'),
+    border: read('--hermes-line', 'rgba(229,229,229,0.44)'),
+    primary: read('--hermes-ink', read('--hermes-blue', '#e5e5e5')),
+    primaryFg: read('--hermes-paper', '#111111'),
+    font: String(body?.fontFamily || 'ui-sans-serif, system-ui, sans-serif'),
+  };
+}
+
+function annotationTargetTab() {
+  return resolveContextTargetTab({
+    activeTab: currentContext?.activeTab,
+    tabs: currentContext?.tabs || [],
+    scope: contextScope,
+  }) || currentContext?.activeTab || null;
+}
+
+function renderPageAnnotationPanel() {
+  const enabled = annotationCommentsEnabled();
+  const commentButton = document.getElementById('commentPageAttachButton');
+  if (commentButton) commentButton.hidden = !enabled;
+  if (els.pageAnnotationPanel) els.pageAnnotationPanel.hidden = true;
+  renderPageCommentTray();
+}
+
+function renderPageCommentTray() {
+  const pins = pageAnnotationStack.pins || [];
+  const count = pins.length;
+  if (els.pageCommentTrayButton) {
+    els.pageCommentTrayButton.hidden = count === 0;
+    els.pageCommentTrayButton.textContent = count === 1 ? 'Comments · 1' : `Comments · ${count}`;
+    if (!count) els.pageCommentTrayButton.setAttribute('aria-expanded', 'false');
+  }
+  if (els.pageCommentTray && count === 0) els.pageCommentTray.hidden = true;
+  if (!els.pageCommentTrayList) return;
+  els.pageCommentTrayList.replaceChildren();
+  for (const pin of pins) {
+    const row = document.createElement('div');
+    row.className = 'page-comment-tray-row';
+    const number = document.createElement('strong');
+    number.textContent = String(pin.number);
+    const body = document.createElement('span');
+    body.textContent = pin.note || formatPageCommentTargetLabel(pin.target || pin.identity || {});
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = '×';
+    remove.addEventListener('click', () => {
+      pageAnnotationStack = removePageAnnotation(pageAnnotationStack, pin.id);
+      persistCurrentPageAnnotations();
+      renderPageCommentTray();
+    });
+    row.append(number, body, remove);
+    els.pageCommentTrayList.append(row);
+  }
+}
+
+function persistCurrentPageAnnotations() {
+  const tab = annotationTargetTab();
+  if (!tab?.id || !pageAnnotationSession) return;
+  persistPageAnnotationSession({
+    storageArea: browserApi.storage?.session,
+    images: pageAnnotationImages,
+    session: {
+      ...pageAnnotationStack,
+      ...pageAnnotationSession,
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    },
+    imageBlobs: Object.fromEntries((pageAnnotationStack.pins || []).map((pin) => [pin.imageRef, pin.imageDataUrl || null]).filter((entry) => entry[1])),
+  }).catch(() => {});
+}
+
+async function cropAnnotationImage(dataUrl, crop) {
+  const image = new globalThis.Image();
+  await new Promise((resolve, reject) => {
+    image.onload = resolve;
+    image.onerror = reject;
+    image.src = dataUrl;
+  });
+  const canvas = document.createElement('canvas');
+  canvas.width = crop.width;
+  canvas.height = crop.height;
+  canvas.getContext('2d').drawImage(image, crop.x, crop.y, crop.width, crop.height, 0, 0, crop.width, crop.height);
+  return canvas.toDataURL('image/png');
+}
+
+async function syncPageAnnotationPins() {
+  const tab = annotationTargetTab();
+  if (!tab?.id || !pageAnnotationSession) return;
+  await sendContentMessageWithInstallFallback(tab.id, {
+    type: PAGE_ANNOTATION_MESSAGES.SYNC,
+    sessionId: pageAnnotationSession.sessionId,
+    documentKey: pageAnnotationSession.documentKey,
+    pins: (pageAnnotationStack.pins || []).map((pin) => ({
+      id: pin.id,
+      number: pin.number,
+      kind: pin.kind,
+      rect: pin.rect,
+      selector: pin.target?.selector || pin.identity?.selector || '',
+    })),
+  }).catch(() => {});
+}
+
+async function stopPageAnnotationSession({ keepPins = false } = {}) {
+  const tab = annotationTargetTab();
+  if (tab?.id) {
+    await sendContentMessageWithInstallFallback(tab.id, { type: PAGE_ANNOTATION_MESSAGES.CANCEL }).catch(() => {});
+  }
+  pageAnnotationDraft = null;
+  pageAnnotationStale = false;
+  if (!keepPins || !(pageAnnotationStack.pins || []).length) {
+    pageAnnotationStack = emptyPageAnnotationStack({});
+    pageAnnotationSession = null;
+    if (tab?.id) {
+      clearPageAnnotationSession({ storageArea: browserApi.storage?.session, images: pageAnnotationImages, tabId: tab.id }).catch(() => {});
+    }
+  }
+  await syncPageAnnotationPins();
+  renderPageAnnotationPanel();
+}
+
+async function startPageAnnotation(mode = pageAnnotationMode) {
+  if (contextScope.mode === CONTEXT_SCOPE_MODES.CHAT_ONLY) {
+    setStatus('warn', 'Chat only', 'Enable browser context before commenting on the page.');
+    return;
+  }
+  const hasWork = Boolean(pageAnnotationDraft) || Boolean(pageAnnotationStack.pins?.length);
+  if (pageAnnotationSession && !hasWork) {
+    await stopPageAnnotationSession();
+    setStatus('ok', 'Page comments closed', 'Click Comment on page again to pick another element.');
+    return;
+  }
+  const [active, tabs] = await Promise.all([activeTab(), tabsForCurrentScope()]);
+  const tab = resolveContextTargetTab({ activeTab: active, tabs, scope: contextScope });
+  if (!tab?.id) {
+    setStatus('warn', 'No tab', 'Open a normal page tab first.');
+    return;
+  }
+  if (isRestrictedUrl(tab.url)) {
+    setStatus('warn', 'Restricted page', 'Page comments are not available on this URL.');
+    return;
+  }
+  if (elementPickActiveForTab(tab)) {
+    await browserApi.tabs.sendMessage(tab.id, { type: ELEMENT_PICK_MESSAGES.CANCEL }).catch(() => {});
+    await clearElementPickState({ tabId: tab.id });
+  }
+  pageAnnotationMode = mode === PAGE_ANNOTATION_MODES.AREA ? PAGE_ANNOTATION_MODES.AREA : PAGE_ANNOTATION_MODES.ELEMENT;
+  pageAnnotationSession = {
+    sessionId: pageAnnotationSession?.sessionId || `page-annotation-${Date.now()}`,
+    tabId: tab.id,
+    safeUrl: tab.url,
+    documentKey: pageAnnotationSession?.documentKey || '',
+  };
+  if (!pageAnnotationStack.sessionId) pageAnnotationStack = emptyPageAnnotationStack(pageAnnotationSession);
+  const response = await sendContentMessageWithInstallFallback(tab.id, {
+    type: PAGE_ANNOTATION_MESSAGES.START,
+    version: 1,
+    sessionId: pageAnnotationSession.sessionId,
+    mode: pageAnnotationMode,
+  });
+  if (response?.ok === false) throw new Error(response.error || 'Could not start page comments');
+  if (response?.documentKey) pageAnnotationSession.documentKey = response.documentKey;
+  renderPageAnnotationPanel();
+  setStatus('ok', 'Comment on page', pageAnnotationMode === PAGE_ANNOTATION_MODES.AREA ? 'Drag a region, then write a comment.' : 'Click an element, then write a comment.');
+}
+
+async function cancelPageAnnotationSelection() {
+  await stopPageAnnotationSession({ keepPins: true });
+  setStatus('ok', 'Page comments closed', (pageAnnotationStack.pins || []).length ? 'Saved comments are still in the queue.' : 'Selection cancelled.');
+}
+
+async function applyPageAnnotationResult(message = {}, sender = {}) {
+  const tabId = sender.tab?.id || annotationTargetTab()?.id;
+  if (!pageAnnotationSession || Number(tabId) !== Number(pageAnnotationSession.tabId)) return;
+  if (message.documentKey && !pageAnnotationSession.documentKey) pageAnnotationSession.documentKey = message.documentKey;
+  const normalized = normalizePageAnnotationResult(message, pageAnnotationSession);
+  if (!normalized) return;
+  const tab = annotationTargetTab();
+  await sendContentMessageWithInstallFallback(tab.id, {
+    type: PAGE_ANNOTATION_MESSAGES.CAPTURE_BEGIN,
+    sessionId: pageAnnotationSession.sessionId,
+    rect: normalized.rect,
+  }).catch(() => {});
+  let imageDataUrl = '';
+  const capture = await captureAnnotationCrop({
+    captureVisibleTab: async (target) => browserApi.tabs.captureVisibleTab(target.windowId || tab.windowId, { format: 'png' }),
+    tab: { ...tab, active: true, id: tab.id, windowId: tab.windowId },
+    rect: normalized.rect,
+    viewport: normalized.viewport || { width: 1, height: 1, devicePixelRatio: 1 },
+    cropImage: cropAnnotationImage,
+  }).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+  await sendContentMessageWithInstallFallback(tab.id, {
+    type: PAGE_ANNOTATION_MESSAGES.CAPTURE_END,
+    sessionId: pageAnnotationSession.sessionId,
+  }).catch(() => {});
+  if (capture?.ok) imageDataUrl = capture.dataUrl;
+  pageAnnotationDraft = {
+    ...normalized,
+    imageDataUrl,
+    imageRef: `${pageAnnotationSession.sessionId}/annotation-${pageAnnotationStack.nextNumber}`,
+    note: '',
+  };
+  if (els.pageAnnotationNote) els.pageAnnotationNote.value = '';
+  renderPageAnnotationPanel();
+  if (!capture?.ok) setStatus('warn', t('ui.comment.capture.unavailable'), capture?.reason || '', { translateDetail: false });
+}
+
+function savePageAnnotationDraft(note) {
+  if (!pageAnnotationDraft) return;
+  pageAnnotationDraft.note = note === undefined
+    ? String(els.pageAnnotationNote?.value || '')
+    : String(note || '');
+  pageAnnotationStack = addPageAnnotation(pageAnnotationStack, pageAnnotationDraft);
+  if (pageAnnotationDraft.imageDataUrl) {
+    pageAnnotationImages.put(pageAnnotationDraft.imageRef, pageAnnotationDraft.imageDataUrl);
+  }
+  pageAnnotationDraft = null;
+  persistCurrentPageAnnotations();
+  syncPageAnnotationPins();
+  renderPageAnnotationPanel();
+}
+
+function discardPageAnnotationDraft() {
+  pageAnnotationDraft = null;
+  renderPageAnnotationPanel();
+}
+
+function flushPageAnnotationsToComposer({ queue = false } = {}) {
+  if (!pageAnnotationStack.pins?.length) return false;
+  const bundle = buildPageAnnotationComposerBundle({
+    ...pageAnnotationStack,
+    safeUrl: pageAnnotationSession?.safeUrl || pageAnnotationStack.safeUrl,
+    pins: pageAnnotationStack.pins.map((pin) => ({
+      ...pin,
+      imageDataUrl: pin.imageDataUrl || null,
+    })),
+  }, {
+    resolveImage: (pin) => pin.imageDataUrl,
+  });
+  if (queue) {
+    queuedTurn = queuePageAnnotationTurn(bundle);
+    renderQueueNotice();
+    setStatus('ok', 'Comments queued', 'Hermes will send them after the current turn finishes.');
+    return true;
+  }
+  const merged = mergePageAnnotationComposerState({ text: els.input.value, attachments }, bundle);
+  els.input.value = merged.text;
+  attachments = merged.attachments;
+  renderAttachments();
+  renderContextWindow();
+  setStatus('ok', 'Comments added', 'Review the composer, then send when you are ready.');
+  return true;
+}
+
+function clearPageAnnotations() {
+  stopPageAnnotationSession({ keepPins: false }).catch(() => {});
+}
+
 async function refreshContext(options = {}) {
+  options = options && typeof options === 'object' ? { ...options } : {};
+  const scopeRevisionId = options.scopeRevisionId ?? scopeRevision.current();
+  delete options.scopeRevisionId;
+  const refreshRevisionId = contextRefreshRevision.begin();
+  const isCurrentScope = () => scopeRevision.isCurrent(scopeRevisionId)
+    && contextRefreshRevision.isCurrent(refreshRevisionId);
+  if (!isCurrentScope()) return currentContext;
   const contextGate = effectiveContextGate(contextScope);
   let captureScope = contextGate.scope;
   if (captureScope.mode === CONTEXT_SCOPE_MODES.CHAT_ONLY) {
+    if (!isCurrentScope()) return currentContext;
     currentContext = { activeTab: null, tabs: [], selectedTabs: [], pageContext: null, contextScope: captureScope };
     selectedTabs = [];
     setStatus(
@@ -12773,10 +14536,12 @@ async function refreshContext(options = {}) {
   }
 
   const [active, tabs] = await Promise.all([activeTab(), tabsForCurrentScope()]);
+  if (!isCurrentScope()) return currentContext;
   const tab = resolveContextTargetTab({ activeTab: active, tabs, scope: captureScope });
   if (captureScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB && tab) {
     const nextScope = contextScopeFromTab(tab, contextScope);
     if (JSON.stringify(nextScope) !== JSON.stringify(contextScope)) {
+      if (!isCurrentScope()) return currentContext;
       contextScope = nextScope;
       captureScope = normalizeContextScope(nextScope);
       saveContextScopeForInstance();
@@ -12788,11 +14553,14 @@ async function refreshContext(options = {}) {
     : pinnedMissing
       ? { ok: false, restricted: true, reason: 'Pinned tab is closed or no longer available.', text: '', selectedText: '', meta: {} }
       : null;
+  if (!isCurrentScope()) return currentContext;
   const youtubeTranscript = tab ? await getYoutubeTranscriptForTab(tab) : null;
+  if (!isCurrentScope()) return currentContext;
   if (pageContext && youtubeTranscript) pageContext.youtubeTranscript = youtubeTranscript;
   if (pageContext && tab) mergeStoredPickIntoPageContext(tab, pageContext);
   syncSelectedTabsFromContextScope(tabs);
   const promptTabs = filterPromptTabs(tabs, captureScope, { activeTab: tab, targetTab: tab });
+  if (!isCurrentScope()) return currentContext;
   currentContext = {
     activeTab: tab,
     tabs,
@@ -13434,43 +15202,59 @@ async function ensureRemoteWsSession(connection) {
 }
 
 async function streamDashboardWsChat(prompt, onDelta, onTool, options = {}) {
-  const connection = await ensureActiveDashboardWsConnection();
+  let connection = await ensureActiveDashboardWsConnection();
   let sessionId = await ensureRemoteWsSession(connection);
-  try {
-    return await streamDashboardWsChatAttempt(connection, sessionId, prompt, onDelta, onTool, options);
-  } catch (error) {
-    if (Number(error?.rpcCode ?? error?.code) !== 4001) throw error;
-    connection.wsSessionId = '';
+  let submitPrompt = true;
+  let reattachAttempts = 0;
+  while (true) {
     try {
-      sessionId = await ensureRemoteWsSession(connection);
-    } catch (resumeError) {
-      if (Number(resumeError?.rpcCode ?? resumeError?.code) !== 4001) throw resumeError;
-      const previousBinding = settings.remoteDashboardSession || {};
-      connection.wsStoredSessionId = '';
-      settings = {
-        ...settings,
-        sessionId: '',
-        remoteDashboardSession: { ...previousBinding, storedSessionId: '' },
-      };
-      sessionId = await ensureRemoteWsSession(connection);
+      return await streamDashboardWsChatAttempt(connection, sessionId, prompt, onDelta, onTool, {
+        ...options,
+        submitPrompt,
+      });
+    } catch (error) {
+      if (Number(error?.rpcCode ?? error?.code) === 4001) {
+        connection.wsSessionId = '';
+        try {
+          sessionId = await ensureRemoteWsSession(connection);
+        } catch (resumeError) {
+          if (Number(resumeError?.rpcCode ?? resumeError?.code) !== 4001) throw resumeError;
+          const previousBinding = settings.remoteDashboardSession || {};
+          connection.wsStoredSessionId = '';
+          settings = {
+            ...settings,
+            sessionId: '',
+            remoteDashboardSession: { ...previousBinding, storedSessionId: '' },
+          };
+          sessionId = await ensureRemoteWsSession(connection);
+        }
+        submitPrompt = true;
+        continue;
+      }
+      if (shouldReattachDashboardStream(error) && reattachAttempts < 8) {
+        reattachAttempts += 1;
+        submitPrompt = false;
+        connection = await ensureActiveDashboardWsConnection();
+        sessionId = await ensureRemoteWsSession(connection);
+        continue;
+      }
+      throw error;
     }
-    return streamDashboardWsChatAttempt(connection, sessionId, prompt, onDelta, onTool, options);
   }
 }
 
-async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDelta, onTool, { signal, onRun, onSteerQueued, onRuntime, knownAssistantTexts = [] } = {}) {
+async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDelta, onTool, { signal, onRun, onSteerQueued, onRuntime, knownAssistantTexts = [], submitPrompt = true, attachments: turnAttachments = [] } = {}) {
   onRun?.(sessionId);
   const { client } = connection;
+  const sessionIds = [sessionId, connection.wsSessionId, connection.wsStoredSessionId];
 
   return new Promise((resolve, reject) => {
     let finalText = '';
     let settled = false;
     const offs = [];
-    const timer = globalThis.setTimeout(() => finish(reject, new Error('Dashboard response timed out.')), 5 * 60 * 1000);
-    const forThisSession = (event) => event.sessionId === sessionId;
-
+    const forThisSession = (event) => matchesDashboardSessionEvent(event, sessionIds);
     const cleanup = () => {
-      globalThis.clearTimeout(timer);
+      watchdog.stop();
       for (const off of offs) off();
       signal?.removeEventListener?.('abort', onAbort);
     };
@@ -13480,6 +15264,45 @@ async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDel
       cleanup();
       fn(value);
     };
+    const seedFromHistory = async () => {
+      const history = await client.request(WS_METHODS.sessionHistory, {
+        session_id: sessionId,
+        profile: safeActiveProfile(),
+      }).catch(() => null);
+      const rows = normalizeGatewayHistoryMessages(history);
+      const answer = latestAssistantAfterUser(rows, prompt)
+        || [...rows].reverse().find((row) => row.role === 'assistant')?.content
+        || '';
+      if (answer && answer !== finalText) {
+        finalText = answer;
+        onDelta(finalText);
+      }
+      return answer;
+    };
+    const handleIdleTimeout = async (error) => {
+      if (settled) return;
+      try {
+        const status = await client.request(WS_METHODS.sessionStatus, { session_id: sessionId }).catch(() => null);
+        await seedFromHistory();
+        if (dashboardWatchdogTimeoutAction(status) === 'keep-listening') {
+          watchdog.ping();
+          return;
+        }
+        if (finalText) {
+          onRuntime?.({ status: 'completed' });
+          finish(resolve, finalText);
+          return;
+        }
+      } catch {
+        // Fall through to reattach.
+      }
+      error.requestAccepted = true;
+      error.reattach = true;
+      finish(reject, error);
+    };
+    const watchdog = createDashboardStreamWatchdog((error) => {
+      void handleIdleTimeout(error);
+    });
     function onAbort() {
       client.request(WS_METHODS.sessionInterrupt, { session_id: sessionId }).catch(() => {});
       finish(reject, new DOMException('Hermes turn stopped by user', 'AbortError'));
@@ -13491,8 +15314,13 @@ async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDel
     }
     signal?.addEventListener?.('abort', onAbort, { once: true });
 
+    offs.push(client.on('*', (event) => {
+      if (forThisSession(event)) watchdog.ping();
+      ingestSubagentGatewayEvent(event);
+    }));
     offs.push(client.on(WS_EVENTS.messageDelta, (event) => {
       if (!forThisSession(event)) return;
+      watchdog.ping();
       finalText += event.payload?.text || '';
       onDelta(finalText);
     }));
@@ -13509,10 +15337,14 @@ async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDel
       finish(resolve, finalText);
     }));
     offs.push(client.on('tool.start', (event) => {
-      if (forThisSession(event) && onTool) onTool({ type: 'tool.start', tool_name: event.payload?.name });
+      if (!forThisSession(event)) return;
+      watchdog.ping();
+      if (onTool) onTool({ type: 'tool.start', tool_name: event.payload?.name });
     }));
     offs.push(client.on('tool.complete', (event) => {
-      if (forThisSession(event) && onTool) onTool({
+      if (!forThisSession(event)) return;
+      watchdog.ping();
+      if (onTool) onTool({
         type: 'tool.complete',
         tool_name: event.payload?.name,
         result: event.payload?.result,
@@ -13525,9 +15357,27 @@ async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDel
       if (!forThisSession(event)) return;
       finish(reject, hermesGatewayTurnError({ payload: event.payload }) || new Error('Dashboard stream error'));
     }));
-    offs.push(client.on('close', () => finish(reject, new Error('Dashboard connection closed mid-turn.'))));
+    offs.push(client.on('close', () => {
+      const error = new Error('Dashboard connection closed mid-turn.');
+      error.requestAccepted = true;
+      error.reattach = true;
+      finish(reject, error);
+    }));
 
-    client.request(WS_METHODS.promptSubmit, { session_id: sessionId, text: prompt }).catch((error) => finish(reject, error));
+    if (submitPrompt) {
+      void (async () => {
+        try {
+          await attachDashboardTurnImages(client, sessionId, turnAttachments);
+        } catch (error) {
+          console.warn('[Hermes Browser] Dashboard image attach failed:', error);
+        }
+        if (settled) return;
+        client.request(WS_METHODS.promptSubmit, { session_id: sessionId, text: prompt }).catch((error) => finish(reject, error));
+      })();
+    } else {
+      void seedFromHistory();
+    }
+    void hydrateSubagentSnapshot(client, sessionId);
   });
 }
 
@@ -13696,8 +15546,45 @@ function sleep(ms) {
 }
 
 async function recoverAcceptedTurn(prompt, turnAttachments = attachments, { signal, timeoutMs = acceptedTurnRecoveryPolicy().maxDurationMs } = {}) {
-  if (usesDashboardWsChatTransport() || !settings.apiKey) return { answer: '', imageSources: [] };
   const userContent = outboundContent(prompt, turnAttachments);
+  if (usesDashboardWsChatTransport()) {
+    const connection = await ensureActiveDashboardWsConnection().catch(() => null);
+    const sessionId = connection ? await ensureRemoteWsSession(connection).catch(() => '') : '';
+    if (!connection?.client || !sessionId) return { answer: '', imageSources: [] };
+    const startedAt = Date.now();
+    let attempt = 0;
+    while (true) {
+      if (signal?.aborted) throw new DOMException('Hermes turn stopped by user', 'AbortError');
+      try {
+        const status = await connection.client.request(WS_METHODS.sessionStatus, { session_id: sessionId }).catch(() => null);
+        const history = await connection.client.request(WS_METHODS.sessionHistory, {
+          session_id: sessionId,
+          profile: safeActiveProfile(),
+        }).catch(() => null);
+        const rows = normalizeGatewayHistoryMessages(history);
+        captureDelegationRuntimePayload({ messages: rows });
+        const answer = latestAssistantAfterUser(rows, userContent);
+        const imageSources = [...new Set([
+          ...resolvedGeneratedImageSourcesFromMessages(rows),
+          ...resolvedGeneratedImageSources(answer),
+        ])];
+        if (answer || imageSources.length) return { answer, imageSources };
+        if (dashboardWatchdogTimeoutAction(status) === 'finish') return { answer: '', imageSources: [] };
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+      }
+      const policy = acceptedTurnRecoveryPolicy({
+        attempt,
+        elapsedMs: Date.now() - startedAt,
+        maxDurationMs: timeoutMs,
+      });
+      if (!policy.shouldContinue) return { answer: '', imageSources: [], reason: 'timeout' };
+      const remainingMs = Math.max(1, policy.maxDurationMs - (Date.now() - startedAt));
+      await sleep(Math.min(policy.delayMs, remainingMs));
+      attempt += 1;
+    }
+  }
+  if (!settings.apiKey) return { answer: '', imageSources: [] };
   const startedAt = Date.now();
   let attempt = 0;
   while (true) {
@@ -14023,6 +15910,23 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
 
   const dashboardTransport = usesDashboardWsChatTransport();
   if (sending) return false;
+  let commentPack = { displayUserText: '', consumed: false };
+  if ((pageAnnotationStack.pins || []).length) {
+    const bundle = buildPageAnnotationComposerBundle({
+      ...pageAnnotationStack,
+      safeUrl: pageAnnotationSession?.safeUrl || pageAnnotationStack.safeUrl,
+      pins: pageAnnotationStack.pins,
+    }, { resolveImage: (pin) => pin.imageDataUrl });
+    const visible = String(userText || '').trim();
+    const merged = mergePageAnnotationComposerState({ text: userText, attachments: turnAttachments }, bundle);
+    const count = pageAnnotationStack.pins.length;
+    commentPack = {
+      displayUserText: visible || (count === 1 ? '1 page comment' : `${count} page comments`),
+      consumed: true,
+    };
+    userText = merged.text;
+    turnAttachments = merged.attachments;
+  }
   if (!canSwitchActiveSession({ sending, runControl: activeRunControl })) {
     if (canRecoverStaleDashboardRunControl({ sending, dashboardTransport, runControl: activeRunControl })) {
       activeRunControl = markRunTerminal(activeRunControl, 'failed');
@@ -14073,13 +15977,23 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
     renderAttachments();
     renderSkillSuggestions();
     renderContextWindow('');
+    forgetComposerDraft();
   }
 
   let didSend = false;
   let streamTerminalStatus = '';
   let streamView = null;
   try {
-    const preparedAttachments = await saveImageAttachmentsForTurn(turnAttachments);
+    let preparedAttachments = await saveImageAttachmentsForTurn(turnAttachments);
+    if (dashboardTransport && preparedAttachments.some((attachment) => attachment.kind === 'image' && attachment.dataUrl)) {
+      try {
+        const attachConnection = await ensureActiveDashboardWsConnection();
+        const attachSessionId = await ensureRemoteWsSession(attachConnection);
+        preparedAttachments = await attachDashboardTurnImages(attachConnection.client, attachSessionId, preparedAttachments);
+      } catch (error) {
+        console.warn('[Hermes Browser] Dashboard image attach failed:', error);
+      }
+    }
     if (typeof turnOptions.resolveUserText === 'function' && dashboardTransport) {
       const consentConnection = await ensureActiveDashboardWsConnection();
       await ensureRemoteWsSession(consentConnection);
@@ -14127,7 +16041,7 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
       : basePromptText;
     const promptUserText = userTextWithAttachments(outboundUserText, preparedAttachments);
     const displayAttachments = preparedAttachments.filter((attachment) => attachment.kind !== 'image');
-    const displayUserText = turnOptions.displayUserText || (displayAttachments.length
+    const displayUserText = turnOptions.displayUserText || commentPack.displayUserText || (displayAttachments.length
       ? `${userText || 'Attachment-only turn.'}\n${displayAttachments.map((attachment) => `${attachmentIcon(attachment.kind)} ${attachment.label}`).join('\n')}`
       : userText);
     const isTabCommand = parsedCommand?.command?.category === 'Tabs';
@@ -14189,18 +16103,16 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
       contextHash,
       contextDelivery,
     });
-    const { node: userNode } = addMessage('user', displayUserText, { contextReceipt: receipt });
+    addMessage('user', displayUserText, {
+      contextReceipt: receipt,
+      attachments: preparedAttachments,
+    });
     // Prior completed assistant bubbles, for run.completed reconcile filtering.
     // Server degraded-history edge case must never restack them into this turn's
     // live bubble. See runtime-events.mjs:filterKnownAssistantReconcileParts.
     const priorAssistantTexts = messages
       .filter((message) => message.role === 'assistant' && message.content)
       .map((message) => String(message.content));
-    appendUserImageAttachments(
-      userNode.querySelector('.message-content'),
-      preparedAttachments,
-      { onOpen: (image) => openGeneratedImageLightbox(image) },
-    );
     const { node } = addMessage('assistant', THINKING_PLACEHOLDER, { persist: false, roleLabel: assistantMessageRoleLabel() });
     streamView = createStreamingMessageUpdater(node);
     let answer = '';
@@ -14254,19 +16166,22 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
       } else if (sessionContextFailureRecovery(streamError, gatewayCapabilities)) {
         throw streamError;
       } else {
+        const fallbackSafeStatus = [404, 405, 501].includes(Number(streamError?.httpStatus ?? streamError?.status));
+        const fallbackSafe = streamError?.fallbackSafe === true || fallbackSafeStatus;
         const recoveryAction = classifyTurnRecovery(streamError);
-        if (recoveryAction === 'reject' || streamError?.streamError || streamError?.requestRejected) {
+        if ((recoveryAction === 'reject' && !fallbackSafe) || streamError?.streamError || (streamError?.requestRejected && !fallbackSafe)) {
           if (liveText) {
             answer = liveText;
           } else {
             throw streamError;
           }
-        } else if (dashboardTransport) {
+        } else if (dashboardTransport && !shouldReattachDashboardStream(streamError) && !isDashboardIdleTimeout(streamError)) {
           // No REST fallback in dashboard-transport mode — the api_server surface
           // is not the active Bot Chat session. Surface genuine WS/ticket errors directly.
-          streamView.update(`Could not reach the Hermes dashboard.\n${streamError.message}`);
+          streamView.update(`Could not reach the Hermes dashboard.
+${streamError.message}`);
           throw streamError;
-        } else if (recoveryAction === 'fallback') {
+        } else if (fallbackSafe || recoveryAction === 'fallback') {
           streamView.update(`Streaming failed, retrying non-streaming...\n${streamError.message}`);
           answer = await fallbackSessionChat(prompt, preparedAttachments, {
             onRuntime: (payload) => {
@@ -14337,6 +16252,12 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
       activeRunControl = markRunTerminal(activeRunControl, streamTerminalStatus || 'completed');
     }
     didSend = true;
+    if (commentPack.consumed) {
+      pageAnnotationStack = emptyPageAnnotationStack(pageAnnotationSession || {});
+      pageAnnotationDraft = null;
+      persistCurrentPageAnnotations();
+      renderPageCommentTray();
+    }
   } catch (error) {
     // Terminal stream errors leave the image-generation placeholder (and its
     // diffusion canvas loop) running: dispose it wherever the turn ends without
@@ -14345,8 +16266,10 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
     if (error?.requestAccepted !== true) streamView?.dispose?.();
     if (error?.requestAccepted === true) {
       if (!turnOptions.preserveComposer && !els.input.value.trim() && !attachments.length) {
-        els.input.value = userText;
-        attachments = [...turnAttachments];
+        els.input.value = commentPack.consumed ? (commentPack.displayUserText || '') : userText;
+        attachments = commentPack.consumed
+          ? [...turnAttachments].filter((item) => item?.source !== 'page-annotations')
+          : [...turnAttachments];
         renderAttachments();
         renderSkillSuggestions();
       }
@@ -14365,8 +16288,10 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
         markGatewayDegraded(error);
         if (!turnOptions.preserveComposer) {
           if (!els.input.value.trim() && !attachments.length) {
-            els.input.value = userText;
-            attachments = [...turnAttachments];
+            els.input.value = commentPack.consumed ? (commentPack.displayUserText || '') : userText;
+            attachments = commentPack.consumed
+              ? [...turnAttachments].filter((item) => item?.source !== 'page-annotations')
+              : [...turnAttachments];
             renderAttachments();
             renderSkillSuggestions();
           } else if (!queuedTurn) {
@@ -14393,8 +16318,10 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
       const requestFailure = turnRequestFailureState(error);
       if (requestFailure?.gatewayStatus === 'connected') {
         if (!turnOptions.preserveComposer && !els.input.value.trim() && !attachments.length) {
-          els.input.value = userText;
-          attachments = [...turnAttachments];
+          els.input.value = commentPack.consumed ? (commentPack.displayUserText || '') : userText;
+          attachments = commentPack.consumed
+            ? [...turnAttachments].filter((item) => item?.source !== 'page-annotations')
+            : [...turnAttachments];
           renderAttachments();
           renderSkillSuggestions();
         }
@@ -15010,10 +16937,34 @@ async function testConnection() {
       ok = true;
       return;
     }
-    const response = await apiFetch('/health', { method: 'GET' });
-    const text = await response.text();
+    let response = null;
+    let text = '';
+    let dashboardAttached = false;
+    if (usesDashboardWsChatTransport() && (activeDashboardWsConnection?.client?.readyState === 1 || desktopDashboardUrl)) {
+      const dashboard = await activateLocalDashboardTransport({ timeoutMs: 5_000 });
+      if (dashboard) {
+        dashboardAttached = true;
+      }
+    }
+    if (!dashboardAttached) {
+      try {
+        response = await apiFetch('/health', { method: 'GET' });
+        text = await response.text();
+      } catch (healthError) {
+        if (!isRemoteMode()) {
+          const dashboard = await activateLocalDashboardTransport({ timeoutMs: 5_000 });
+          if (dashboard) {
+            dashboardAttached = true;
+          } else {
+            throw healthError;
+          }
+        } else {
+          throw healthError;
+        }
+      }
+    }
     if (!connectionController.isCurrent(generation)) return;
-    if (!response.ok) {
+    if (response && !response.ok && !dashboardAttached) {
       if (isRemoteMode()) {
         const diagnostic = classifyRemoteGatewaySetup({
           url: settings.gatewayUrl,
@@ -15025,24 +16976,31 @@ async function testConnection() {
         renderRemoteDiagnostics(diagnostic);
         throw new Error(`${diagnostic.title}: ${diagnostic.detail}`);
       }
-      throw new Error(`${response.status}: ${text}`);
-    }
-    await loadGatewayCapabilities({ quiet: true, healthOk: true });
-    if (!connectionController.isCurrent(generation)) return;
-    if (!apiCredentialSatisfied(settings) && gatewayCapabilities.browserPairing && automaticApiPairingAllowed(settings)) {
-      // connectApiWithPairing() starts its own connection generation, so the
-      // generation captured above is stale the moment it succeeds. Decide on
-      // the live connection state instead, and finish the test right there:
-      // pairing already ran the full canonical readiness cascade.
-      await connectApiWithPairing();
-      if (!isConnected()) {
-        setTestConnectionBusy(false);
-        flashTestConnectionResult(false);
-        throw new Error('Pairing was not completed. Approve the Hermes Browser request in the opened tab, then test again.');
+      const dashboard = !isRemoteMode() ? await activateLocalDashboardTransport({ timeoutMs: 5_000 }) : null;
+      if (dashboard) {
+        dashboardAttached = true;
+      } else {
+        throw new Error(`${response.status}: ${text}`);
       }
-      setTestConnectionBusy(false);
-      flashTestConnectionResult(true);
-      return;
+    }
+    if (!dashboardAttached) {
+      await loadGatewayCapabilities({ quiet: true, healthOk: true });
+      if (!connectionController.isCurrent(generation)) return;
+      if (!apiCredentialSatisfied(settings) && gatewayCapabilities.browserPairing && automaticApiPairingAllowed(settings)) {
+        // connectApiWithPairing() starts its own connection generation, so the
+        // generation captured above is stale the moment it succeeds. Decide on
+        // the live connection state instead, and finish the test right there:
+        // pairing already ran the full canonical readiness cascade.
+        await connectApiWithPairing();
+        if (!isConnected()) {
+          setTestConnectionBusy(false);
+          flashTestConnectionResult(false);
+          throw new Error('Pairing was not completed. Approve the Hermes Browser request in the opened tab, then test again.');
+        }
+        setTestConnectionBusy(false);
+        flashTestConnectionResult(true);
+        return;
+      }
     }
 
     // Manual tests complete the same one readiness lifecycle as startup, so a
@@ -15050,13 +17008,14 @@ async function testConnection() {
     const readiness = await runPanelConnectionReadiness({ restoreSettings: false });
     if (!connectionController.isCurrent(generation)) return;
     const hasSessionRoutes = Boolean(readiness.sessionId) || sessionRoutesAvailable !== false;
-    if (!connectionController.transition(generation, CONNECTION_STATES.READY, { gateway: 'api' })) return;
+    const gatewayTransportKind = dashboardAttached ? 'dashboard-ws' : 'api';
+    if (!connectionController.transition(generation, CONNECTION_STATES.READY, { gateway: gatewayTransportKind })) return;
     setStatus(
       'ok',
-      hasSessionRoutes ? 'Hermes gateway + session API connected' : 'Hermes gateway connected',
-      hasSessionRoutes ? normalizeGatewayUrl(settings.gatewayUrl) : `${normalizeGatewayUrl(settings.gatewayUrl)} - OpenAI-compatible fallback mode`,
+      dashboardAttached ? 'Hermes Desktop connected' : (hasSessionRoutes ? 'Hermes gateway + session API connected' : 'Hermes gateway connected'),
+      dashboardAttached ? (desktopDashboardUrl || normalizeGatewayUrl(settings.gatewayUrl)) : (hasSessionRoutes ? normalizeGatewayUrl(settings.gatewayUrl) : `${normalizeGatewayUrl(settings.gatewayUrl)} - OpenAI-compatible fallback mode`),
     );
-    markGatewayReachable(normalizeGatewayUrl(settings.gatewayUrl));
+    markGatewayReachable(dashboardAttached ? (desktopDashboardUrl || normalizeGatewayUrl(settings.gatewayUrl)) : normalizeGatewayUrl(settings.gatewayUrl));
     lastRemoteDiagnostic = null;
     renderRemoteDiagnostics(null);
 
@@ -15388,6 +17347,10 @@ function bindEvents() {
     taskStackExpanded = !taskStackExpanded;
     renderTaskStack();
   });
+  els.subagentStackToggle?.addEventListener('click', () => {
+    subagentExpanded = !subagentExpanded;
+    renderSubagentStack();
+  });
   els.openFullViewButton?.addEventListener('click', () => {
     openFullView().catch((error) => setStatus('warn', 'Could not open full view', error?.message || String(error), { translateDetail: false }));
   });
@@ -15539,9 +17502,48 @@ function bindEvents() {
   });
   els.retryRunStatusButton?.addEventListener('click', () => { void retryActiveRunTerminalStatus(); });
   els.discardHeldQueueButton?.addEventListener('click', discardHeldQueuedTurn);
+  els.pageCommentTrayButton?.addEventListener('click', () => {
+    if (!els.pageCommentTray) return;
+    const open = els.pageCommentTray.hidden;
+    els.pageCommentTray.hidden = !open;
+    els.pageCommentTrayButton.setAttribute('aria-expanded', String(open));
+  });
+  els.pageCommentTraySend?.addEventListener('click', () => {
+    if (els.pageCommentTray) els.pageCommentTray.hidden = true;
+    void askHermes(String(els.input?.value || '').trim(), [...attachments]);
+  });
+  window.addEventListener('pagehide', () => {
+    persistCurrentComposerDraft({ immediate: true });
+    const tab = currentContext?.activeTab || annotationTargetTab();
+    if (tab?.id) {
+      browserApi.tabs.sendMessage(tab.id, { type: PAGE_ANNOTATION_MESSAGES.ABORT }).catch(() => {});
+    }
+    pageCommentPickActive = false;
+    void clearElementPickState({ tabId: tab?.id });
+  });
   browserApi.runtime.onMessage.addListener((message, sender) => {
     if (message?.type === ELEMENT_PICK_MESSAGES.RESULT) {
       applyPickedElementResult(message, sender);
+      return;
+    }
+    if (message?.type === PAGE_ANNOTATION_MESSAGES.CARD_SUBMIT) {
+      void commitPageCommentFromCard(message);
+      return;
+    }
+    if (message?.type === PAGE_ANNOTATION_MESSAGES.CARD_CANCEL) {
+      cancelPageCommentCard();
+      return;
+    }
+    if (message?.type === PAGE_ANNOTATION_MESSAGES.RESULT) {
+      applyPageAnnotationResult(message, sender);
+      return;
+    }
+    if (message?.type === PAGE_ANNOTATION_MESSAGES.PICKING && message.documentKey && pageAnnotationSession) {
+      pageAnnotationSession.documentKey = message.documentKey;
+      return;
+    }
+    if (message?.type === PAGE_ANNOTATION_MESSAGES.ERROR) {
+      if (message.reason === 'iframe_not_supported') setStatus('warn', t('ui.comment.iframe.unsupported'), '');
       return;
     }
     if (message?.type === ELEMENT_PICK_MESSAGES.CANCELLED) {
@@ -15575,6 +17577,14 @@ function bindEvents() {
   });
   browserApi.tabs?.onUpdated?.addListener?.((tabId, changeInfo) => {
     if (changeInfo?.url) clearPickedElementForTab(tabId, { silent: true });
+    if (changeInfo?.url && pageAnnotationSession?.tabId === tabId) {
+      pageAnnotationStale = Boolean(pageAnnotationStack.pins?.length);
+      if (!pageAnnotationStale && !pageAnnotationDraft) {
+        stopPageAnnotationSession().catch(() => {});
+      } else {
+        renderPageAnnotationPanel();
+      }
+    }
   });
   browserApi.tabs?.onRemoved?.addListener?.((tabId) => {
     clearPickedElementForTab(tabId, { silent: true });
@@ -15782,6 +17792,12 @@ function bindEvents() {
         await startElementPick();
         return;
       }
+      if (kind === 'comment-page') {
+        els.attachMenu.hidden = true;
+        els.attachMenuButton.setAttribute('aria-expanded', 'false');
+        await startElementPick({ purpose: 'comment' });
+        return;
+      }
       if (kind === 'clear-pick') {
         clearPickedElementForActiveTab();
         return;
@@ -15794,6 +17810,23 @@ function bindEvents() {
     } catch (error) {
       addMessage('system', `Attach failed: ${error?.message || String(error)}`);
     }
+  });
+  els.pageAnnotationElementButton?.addEventListener('click', () => {
+    startPageAnnotation(PAGE_ANNOTATION_MODES.ELEMENT).catch((error) => setStatus('warn', 'Page comments failed', error?.message || String(error), { translateDetail: false }));
+  });
+  els.pageAnnotationAreaButton?.addEventListener('click', () => {
+    startPageAnnotation(PAGE_ANNOTATION_MODES.AREA).catch((error) => setStatus('warn', 'Page comments failed', error?.message || String(error), { translateDetail: false }));
+  });
+  els.pageAnnotationCancelButton?.addEventListener('click', () => {
+    cancelPageAnnotationSelection().catch(() => {});
+  });
+  els.pageAnnotationSaveButton?.addEventListener('click', savePageAnnotationDraft);
+  els.pageAnnotationDiscardButton?.addEventListener('click', discardPageAnnotationDraft);
+  els.pageAnnotationFlushButton?.addEventListener('click', () => flushPageAnnotationsToComposer());
+  els.pageAnnotationQueueButton?.addEventListener('click', () => flushPageAnnotationsToComposer({ queue: true }));
+  els.pageAnnotationClearButton?.addEventListener('click', clearPageAnnotations);
+  els.pageAnnotationDoneButton?.addEventListener('click', () => {
+    stopPageAnnotationSession({ keepPins: false }).catch(() => {});
   });
   els.fileInput.addEventListener('change', async () => {
     await attachFiles(els.fileInput.files);
@@ -15905,6 +17938,7 @@ function bindEvents() {
   });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
+      persistCurrentComposerDraft({ immediate: true });
       if (browserControlPollTimer) clearTimeout(browserControlPollTimer);
       browserControlPollTimer = null;
       return;
@@ -16140,6 +18174,7 @@ function bindEvents() {
     renderContextWindow();
     renderSkillSuggestions();
     updateComposerBusyState();
+    persistCurrentComposerDraft();
   });
   document.querySelectorAll('[data-prompt]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -16223,8 +18258,8 @@ function bindEvents() {
         .catch((error) => setStatus('warn', 'Could not switch to Chat only', error?.message || String(error), { translateDetail: false }));
       return;
     }
-    if (action === 'follow-active' || action === 'unlock') {
-      unlockContextScope().catch((error) => setStatus('warn', 'Could not unlock tab scope', error?.message || String(error), { translateDetail: false }));
+    if (action === 'follow-active' || action === 'unlock' || action === 'attached-reset') {
+      unlockContextScope().catch((error) => setStatus('warn', 'Could not reset tab scope', error?.message || String(error), { translateDetail: false }));
       return;
     }
     if (action === 'pin-active') {
@@ -16318,6 +18353,7 @@ async function runPanelConnectionReadiness({ restoreSettings = false } = {}) {
         if (restoreSettings) {
           await loadSettings({ restoreMessages: false });
           await loadElementPickState();
+          await loadPageAnnotationState();
         }
         settings = migrateConnectionSettings(settings);
         return {
@@ -16462,6 +18498,7 @@ subscribeLocale(() => {
 await initI18n();
 hbeBootEmit('panel:i18n-ready');
 bindEvents();
+void loadBotProfileOverrides();
 void refreshPetAvatarCache();
 await runStartupReadiness();
 renderBrowserControl();

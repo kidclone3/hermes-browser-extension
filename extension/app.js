@@ -19,12 +19,20 @@ import {
 } from './lib/common.mjs';
 import { renderMarkdownSafe } from './lib/sanitizer.mjs';
 import { highlightCodeBlocks } from './lib/code-highlighting.mjs';
+import { enhanceMarkdownCodeBlocks } from './lib/markdown-code-copy.mjs';
+import {
+  completionRevealPlan,
+  newestAssistantReply,
+  revealSlice,
+  trailingNewMessages,
+} from './lib/completion-reveal.mjs';
 import {
   assistModelRoutingSupported,
   resolveAssistModelBindingFromCatalog,
 } from './lib/assist-model-contract.mjs';
 import {
   DEFAULT_GATEWAY_CAPABILITIES,
+  dashboardWsGatewayCapabilities,
   normalizeGatewayCapabilities,
 } from './lib/capabilities.mjs';
 import { createHermesClient } from './lib/hermes-client.mjs';
@@ -68,12 +76,15 @@ import { getLocale, initI18n, populateLanguageSelect, setLocale, subscribeLocale
 import { mountContextMenuEditor } from './lib/context-menu-editor-client.mjs';
 import {
   MODEL_CATALOG_CACHE_STORAGE_KEY,
+  dashboardFileStreamUrl,
   dashboardModelDiscoveryBaseUrl,
   discoverCanonicalProviderCatalog,
   discoverGatewayVirtualModels,
   discoverModelsFromDashboard,
   discoverModelsFromRegistry,
   discoverModelsFromSessions,
+  fetchDashboardMediaDataUrl,
+  fetchDashboardSessionToken,
   mergeModelsWithRegistry,
   mergeVirtualModelRows,
   modelCatalogCacheKey,
@@ -87,7 +98,9 @@ import {
 import {
   appendGeneratedImageSourcesToMessages,
   appendUserImageAttachments,
+  extractHistoryMediaAttachments,
   extractMediaTags,
+  normalizeUserImageAttachments,
   preserveUserImageAttachments,
   resolveImageSource,
   resolvedGeneratedImageSources,
@@ -95,6 +108,20 @@ import {
   resolvedGeneratedImageSourcesFromResult,
   stripGeneratedImageEchoes,
 } from './lib/image-render.mjs';
+import { classifyMediaKind, resolveMediaFetchPlan } from './lib/media-persistence.mjs';
+import {
+  activeSubagentView,
+  applySubagentEvent,
+  formatSubagentElapsed,
+  isSubagentEventName,
+  pruneFinishedSubagents,
+  reconcileSubagentSnapshot,
+  SUBAGENT_STEER_ICON,
+  SUBAGENT_STOP_ICON,
+  subagentControlPayload,
+  subagentStackSummary,
+  subagentsFromListResult,
+} from './lib/subagent-stack.mjs';
 import { modelLockRequestOutcome, readHermesSse, runSteerFailureState } from './lib/fulltab-runtime.mjs';
 import { parseBrowserCommand, resolveCommandPrompt } from './lib/commands.mjs';
 import { createDiffusionCanvas } from './lib/diffusion-canvas.mjs';
@@ -117,6 +144,7 @@ import {
   persistGroupProjectionAppend,
 } from './lib/bot-group-runtime.mjs';
 import { thinkingIndicatorMarkup } from './lib/web-thinking-indicator.mjs';
+import { clearComposerDraft, loadComposerDraft, persistComposerDraft } from './lib/composer-draft.mjs';
 import { createImageViewerState, imageViewerReducer } from './lib/image-viewer.mjs';
 import { writeAssistantClipboardEvent } from './lib/assistant-clipboard.mjs';
 import { taskStackFromToolEvent, taskStackProgress, updateTaskStackStore } from './lib/task-stack.mjs';
@@ -138,11 +166,6 @@ import {
   mergeGroupChatLists,
   splitBotRosterRows,
 } from './lib/bot-mode.mjs';
-import {
-  CANONICAL_PET_NAMINE_DATA_URL,
-  CANONICAL_PET_RIKU_DATA_URL,
-  CANONICAL_PET_ROXAS_DATA_URL,
-} from './lib/pet-avatar.mjs';
 import { blobatar as blobatarSvg } from './lib/vendor/blobatar-2.0.0.js';
 import {
   acceptedTurnRecoveryPolicy,
@@ -153,6 +176,7 @@ import {
   turnRequestFailureState,
 } from './lib/turn-recovery.mjs';
 import { buildDashboardWsUrl, buildDashboardWsUrlWithCredential, buildSessionModelSwitchRequest, createGatewayClient, establishGatewaySession, normalizeGatewayHistoryMessages, runtimeModelFromSessionStatus, WS_EVENTS, WS_METHODS } from './lib/gateway-ws.mjs';
+import { createDashboardStreamWatchdog, dashboardWatchdogTimeoutAction, matchesDashboardSessionEvent, shouldReattachDashboardStream } from './lib/dashboard-stream-watchdog.mjs';
 import { isTrustedDashboardOrigin, mintWsTicket, originOf, ticketFailureHelp } from './lib/dashboard-bridge.mjs';
 import {
   CONTEXT_CONSENT_STORAGE_KEY,
@@ -291,6 +315,11 @@ const els = {
   taskStackSummary: $('#taskStackSummary'),
   taskStackProgress: $('#taskStackProgress'),
   taskStackList: $('#taskStackList'),
+  subagentStack: $('#subagentStack'),
+  subagentStackToggle: $('#subagentStackToggle'),
+  subagentStackSummary: $('#subagentStackSummary'),
+  subagentStackList: $('#subagentStackList'),
+  subagentStackDetail: $('#subagentStackDetail'),
   settingsButton: $('#settingsButton'),
   wakeButton: $('#wakeButton'),
   settingsDialog: $('#settingsDialog'),
@@ -395,6 +424,14 @@ let activeSessionId = handoff.sessionId;
 let activeMessages = [];
 let taskStackStore = {};
 let taskStackExpanded = true;
+let subagentState = {};
+let subagentExpanded = true;
+let subagentSelectedId = '';
+let subagentSteerDraft = '';
+let subagentControlBusy = false;
+let subagentControlError = '';
+let subagentTimer = null;
+const subagentBoundClients = new WeakSet();
 let availableModels = [];
 let selectedModelProvider = '';
 let modelSelectionTarget = 'chat';
@@ -406,6 +443,9 @@ let activeRunControl = null;
 let runControlGeneration = 0;
 let attachments = [];
 let queuedTurn = null;
+let composerDraftSaveTimer = 0;
+let restoringComposerDraft = false;
+const WEB_COMPOSER_DRAFT_INSTANCE = 'web';
 const approvedForeignSessionIds = new Set();
 let pendingForeignTurn = null;
 let availableSkills = [];
@@ -471,7 +511,7 @@ const delegationWatchManager = createDelegationWatchManager({
     return { messages: await client.getSessionMessages(watch.durableSessionId) };
   },
   onComplete: async (watch, result) => {
-    await commitFullTabSessionMessages(result?.messages || [], {
+    await commitFullTabSessionMessagesWithReveal(result?.messages || [], {
       sessionId: watch.durableSessionId,
       requestId: webSessionLoadRequestId,
     });
@@ -659,6 +699,7 @@ async function ensureDashboardConnection() {
   });
   await gatewayClient.connect(buildDashboardWsUrl(settings.gatewayUrl, ticket.ticket));
   dashboardConnection = { client: gatewayClient, origin: desiredOrigin, tabId };
+  bindSubagentClient(gatewayClient);
   return dashboardConnection;
 }
 
@@ -790,7 +831,7 @@ function botProfileDisplayName(row) {
   const rawTitle = String(row?.title || '').trim();
   if (rawDisplay && rawDisplay.toLowerCase() !== 'default') return rawDisplay;
   if (rawTitle && rawTitle.toLowerCase() !== 'default') return rawTitle;
-  if (profileName.toLowerCase() === 'default' || !profileName) return 'Roxas';
+  if (profileName.toLowerCase() === 'default' || !profileName) return 'Default';
       return profileName.charAt(0).toUpperCase() + profileName.slice(1);
 }
 
@@ -800,35 +841,7 @@ function botProfileDisplayTitle(row) {
 }
 
 // Deterministic Blobatar-style face for the Hermes Web rail (same algorithm as the side panel).
-function appendWebBotModeAvatar(container, displayName, profileName = '') {
-  const normalized = String(profileName || displayName || '').toLowerCase().trim();
-  if (normalized === 'roxas' || normalized === 'default') {
-    const img = document.createElement('img');
-    img.src = CANONICAL_PET_ROXAS_DATA_URL;
-    img.alt = '';
-    img.className = 'bot-mode-avatar-pet';
-    img.title = 'Roxas';
-    container.replaceChildren(img);
-    return;
-  }
-  if (normalized === 'namine') {
-    const img = document.createElement('img');
-    img.src = CANONICAL_PET_NAMINE_DATA_URL;
-    img.alt = '';
-    img.className = 'bot-mode-avatar-pet';
-    img.title = 'Naminé';
-    container.replaceChildren(img);
-    return;
-  }
-  if (normalized === 'riku') {
-    const img = document.createElement('img');
-    img.src = CANONICAL_PET_RIKU_DATA_URL;
-    img.alt = '';
-    img.className = 'bot-mode-avatar-pet';
-    img.title = 'Riku';
-    container.replaceChildren(img);
-    return;
-  }
+function appendWebBotModeAvatar(container, displayName) {
   const seed = String(displayName || 'agent').trim();
   let svgMarkup = '';
   try {
@@ -1150,6 +1163,7 @@ async function openWebBotProfile(row) {
   await browserApi.storage.local.set({ hermesBrowserSettings: settings });
   renderConnectionTruth({ status: 'online' });
   renderWebBotModeRoster(els.webBotModeSearch?.value);
+  await loadSkills({ quiet: true });
   if (row.canonical.status === 'mismatch') {
     els.webBotModeStatus.textContent = `Open ${row.displayName} in Hermes Desktop Bot Mode to repair its canonical Bot Chat.`;
     return false;
@@ -1211,20 +1225,46 @@ async function readAcceptedHermesSse(response, options = {}) {
   }
 }
 
-async function streamDashboardPrompt(prompt, { signal, onDelta, onTool, onRun } = {}) {
-  const connection = await ensureDashboardConnection();
+async function streamDashboardPrompt(prompt, { signal, onDelta, onTool, onRun, attachments: turnAttachments = [] } = {}) {
+  let connection = await ensureDashboardConnection();
   if (!dashboardLiveSessionId) await establishDashboardSession(activeSessionId);
-  const sessionId = dashboardLiveSessionId;
+  let sessionId = dashboardLiveSessionId;
   onRun?.(sessionId);
+  let submitPrompt = true;
+  let reattachAttempts = 0;
+  while (true) {
+    try {
+      return await streamDashboardPromptAttempt(connection, sessionId, prompt, {
+        signal,
+        onDelta,
+        onTool,
+        submitPrompt,
+        attachments: turnAttachments,
+      });
+    } catch (error) {
+      if (shouldReattachDashboardStream(error) && reattachAttempts < 8) {
+        reattachAttempts += 1;
+        submitPrompt = false;
+        connection = await ensureDashboardConnection();
+        if (!dashboardLiveSessionId) await establishDashboardSession(activeSessionId);
+        sessionId = dashboardLiveSessionId;
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+async function streamDashboardPromptAttempt(connection, sessionId, prompt, { signal, onDelta, onTool, submitPrompt = true, attachments: turnAttachments = [] } = {}) {
   return new Promise((resolve, reject) => {
     let finalText = '';
     let submitAccepted = false;
     let settled = false;
     const offs = [];
-    const timer = globalThis.setTimeout(() => finish(reject, new Error('Dashboard response timed out.')), 5 * 60 * 1000);
-    const forThisSession = (event) => event.sessionId === sessionId;
+    const sessionIds = [sessionId, dashboardLiveSessionId, activeSessionId];
+    const forThisSession = (event) => matchesDashboardSessionEvent(event, sessionIds);
     const cleanup = () => {
-      globalThis.clearTimeout(timer);
+      watchdog.stop();
       for (const off of offs) off();
       signal?.removeEventListener?.('abort', onAbort);
     };
@@ -1234,14 +1274,57 @@ async function streamDashboardPrompt(prompt, { signal, onDelta, onTool, onRun } 
       cleanup();
       fn(value);
     };
+    const seedFromHistory = async () => {
+      const history = await connection.client.request(WS_METHODS.sessionHistory, {
+        session_id: sessionId,
+        profile: settings.activeProfile || '',
+      }).catch(() => null);
+      const rows = dashboardHistoryMessages(history);
+      const answer = latestAssistantAfterUser(rows, prompt)
+        || [...rows].reverse().find((row) => row.role === 'assistant')?.content
+        || '';
+      if (answer && answer !== finalText) {
+        finalText = answer;
+        onDelta?.(finalText);
+      }
+      return answer;
+    };
+    const handleIdleTimeout = async (error) => {
+      if (settled) return;
+      try {
+        const status = await connection.client.request(WS_METHODS.sessionStatus, { session_id: sessionId }).catch(() => null);
+        await seedFromHistory();
+        if (dashboardWatchdogTimeoutAction(status) === 'keep-listening') {
+          watchdog.ping();
+          return;
+        }
+        if (finalText) {
+          finish(resolve, finalText);
+          return;
+        }
+      } catch {
+        // Fall through to reattach.
+      }
+      error.requestAccepted = true;
+      error.reattach = true;
+      finish(reject, error);
+    };
+    const watchdog = createDashboardStreamWatchdog((error) => {
+      void handleIdleTimeout(error);
+    });
     const onAbort = () => {
       connection.client.request(WS_METHODS.sessionInterrupt, { session_id: sessionId }).catch(() => {});
       finish(reject, new DOMException('Hermes turn stopped by user', 'AbortError'));
     };
     if (signal?.aborted) return onAbort();
     signal?.addEventListener?.('abort', onAbort, { once: true });
+    offs.push(connection.client.on('*', (event) => {
+      if (forThisSession(event)) watchdog.ping();
+      ingestSubagentGatewayEvent(event);
+    }));
     offs.push(connection.client.on(WS_EVENTS.messageDelta, (event) => {
       if (!forThisSession(event)) return;
+      watchdog.ping();
       finalText += event.payload?.text || '';
       onDelta?.(finalText);
     }));
@@ -1257,10 +1340,14 @@ async function streamDashboardPrompt(prompt, { signal, onDelta, onTool, onRun } 
       finish(resolve, finalText);
     }));
     offs.push(connection.client.on('tool.start', (event) => {
-      if (forThisSession(event)) onTool?.({ type: 'tool.start', tool_name: event.payload?.name });
+      if (!forThisSession(event)) return;
+      watchdog.ping();
+      onTool?.({ type: 'tool.start', tool_name: event.payload?.name });
     }));
     offs.push(connection.client.on('tool.complete', (event) => {
-      if (forThisSession(event)) onTool?.({
+      if (!forThisSession(event)) return;
+      watchdog.ping();
+      onTool?.({
         type: 'tool.complete',
         tool_name: event.payload?.name,
         result: event.payload?.result,
@@ -1272,16 +1359,35 @@ async function streamDashboardPrompt(prompt, { signal, onDelta, onTool, onRun } 
     }));
     offs.push(connection.client.on('close', () => {
       const error = new Error('Dashboard connection closed mid-turn.');
-      error.requestAccepted = submitAccepted;
+      error.requestAccepted = submitAccepted || !submitPrompt;
+      error.reattach = true;
       finish(reject, error);
     }));
-    connection.client.request(WS_METHODS.promptSubmit, { session_id: sessionId, text: prompt })
-      .then(() => { submitAccepted = true; })
-      .catch((error) => finish(reject, error));
+    if (submitPrompt) {
+      void (async () => {
+        try {
+          await attachDashboardPromptImages(connection.client, sessionId, turnAttachments);
+        } catch (error) {
+          console.warn('[Hermes Browser] Dashboard image attach failed:', error);
+        }
+        if (settled) return;
+        connection.client.request(WS_METHODS.promptSubmit, { session_id: sessionId, text: prompt })
+          .then(() => { submitAccepted = true; })
+          .catch((error) => finish(reject, error));
+      })();
+    } else {
+      void seedFromHistory();
+    }
+    void hydrateSubagentSnapshot(connection.client, sessionId);
   });
 }
 
 async function loadGatewayCapabilities() {
+  if (usesDashboardTicketTransport() && dashboardConnection?.client?.readyState === 1) {
+    gatewayCapabilities = dashboardWsGatewayCapabilities({ health: true, source: 'dashboard-ws' });
+    renderInlineAssistModelOptions();
+    return gatewayCapabilities;
+  }
   try {
     const response = await client.fetch('/v1/capabilities', { method: 'GET', cache: 'no-store' });
     const payload = await client.readJson(response);
@@ -1336,6 +1442,229 @@ function renderTaskStack() {
     return item;
   });
   els.taskStackList.replaceChildren(...rows);
+}
+
+function currentSubagentSessionKeys() {
+  return [...new Set([
+    activeSessionId,
+    dashboardLiveSessionId,
+    dashboardConnection?.wsSessionId,
+    dashboardConnection?.wsStoredSessionId,
+  ].map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function currentSubagentSessionKey() {
+  return currentSubagentSessionKeys()[0] || '';
+}
+
+function currentSubagentItems() {
+  for (const key of currentSubagentSessionKeys()) {
+    if (Array.isArray(subagentState[key]) && subagentState[key].length) return subagentState[key];
+  }
+  return [];
+}
+
+function ensureSubagentTimer(liveCount) {
+  if (liveCount && !subagentTimer) {
+    subagentTimer = setInterval(() => renderSubagentStack(), 1000);
+  } else if (!liveCount && subagentTimer) {
+    clearInterval(subagentTimer);
+    subagentTimer = null;
+  }
+}
+
+function ingestSubagentGatewayEvent(event) {
+  const type = String(event?.type || event?.name || '').trim();
+  const keys = currentSubagentSessionKeys();
+  const eventSession = String(
+    event?.sessionId
+    || event?.session_id
+    || event?.payload?.parent_session_id
+    || event?.payload?.session_id
+    || '',
+  ).trim();
+  if (type === 'message.start' && (eventSession || keys[0])) {
+    subagentState = pruneFinishedSubagents(subagentState, eventSession || keys[0]);
+    renderSubagentStack();
+    return;
+  }
+  if (!isSubagentEventName(type)) return;
+  if (eventSession && keys.length && !keys.includes(eventSession)) return;
+  const key = eventSession || keys[0] || '';
+  if (!key) return;
+  subagentState = applySubagentEvent(subagentState, key, event);
+  if (keys[0] && keys[0] !== key) {
+    subagentState = applySubagentEvent(subagentState, keys[0], event);
+  }
+  renderSubagentStack();
+}
+
+function bindSubagentClient(client) {
+  if (!client?.on || subagentBoundClients.has(client)) return;
+  subagentBoundClients.add(client);
+  client.on('*', (event) => ingestSubagentGatewayEvent(event));
+}
+
+async function hydrateSubagentSnapshot(client, sessionId = '') {
+  const sid = String(sessionId || currentSubagentSessionKey() || '').trim();
+  if (!client?.request || !sid) return;
+  try {
+    const result = await client.request(WS_METHODS.subagentList, { session_id: sid });
+    subagentState = reconcileSubagentSnapshot(subagentState, sid, subagentsFromListResult(result));
+    renderSubagentStack();
+  } catch {
+    // Older gateways omit subagent.list.
+  }
+}
+
+async function runSelectedSubagentControl(action, text = '') {
+  const connection = dashboardConnection;
+  const sessionId = String(dashboardLiveSessionId || currentSubagentSessionKey() || '').trim();
+  const payload = subagentControlPayload(action, {
+    sessionId,
+    subagentId: subagentSelectedId,
+    text,
+  });
+  if (!connection?.client || !payload.session_id || !payload.subagent_id) return;
+  if (action === 'steer' && !payload.text) return;
+  subagentControlBusy = true;
+  subagentControlError = '';
+  renderSubagentStack();
+  try {
+    const method = action === 'steer' ? WS_METHODS.subagentSteer : WS_METHODS.subagentInterrupt;
+    const result = await connection.client.request(method, payload);
+    if (action === 'interrupt' && result && result.found === false) {
+      throw new Error('Subagent is no longer running.');
+    }
+    if (action === 'steer') subagentSteerDraft = '';
+  } catch (error) {
+    subagentControlError = String(error?.message || error || 'Subagent control failed');
+  } finally {
+    subagentControlBusy = false;
+    renderSubagentStack();
+  }
+}
+
+function renderSubagentStack() {
+  if (!els.subagentStack) return;
+  const items = currentSubagentItems();
+  const live = activeSubagentView(items);
+  ensureSubagentTimer(live.length);
+  els.subagentStack.hidden = !live.length;
+  if (!live.length) {
+    els.subagentStackList.replaceChildren();
+    if (els.subagentStackDetail) {
+      els.subagentStackDetail.hidden = true;
+      els.subagentStackDetail.replaceChildren();
+    }
+    subagentSelectedId = '';
+    return;
+  }
+  if (subagentSelectedId && !live.some((item) => item.id === subagentSelectedId)) subagentSelectedId = '';
+  els.subagentStack.dataset.expanded = String(subagentExpanded);
+  els.subagentStackToggle?.setAttribute('aria-expanded', String(subagentExpanded));
+  if (els.subagentStackSummary) els.subagentStackSummary.textContent = subagentStackSummary(live);
+  const listScrollTop = els.subagentStackList.scrollTop;
+  const oldStream = els.subagentStackDetail?.querySelector('.subagent-stack-stream');
+  const streamScrollTop = oldStream?.scrollTop || 0;
+  const streamScrollLeft = oldStream?.scrollLeft || 0;
+  const keepFocus = document.activeElement?.id === 'subagentSteerInput';
+  const rows = live.map((item) => {
+    const row = document.createElement('li');
+    row.className = `task-stack-item subagent-stack-item ${item.status}`;
+    row.dataset.subagentId = item.id;
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', String(item.id === subagentSelectedId));
+    const pulse = document.createElement('span');
+    pulse.className = 'subagent-stack-pulse';
+    pulse.setAttribute('aria-hidden', 'true');
+    const copy = document.createElement('span');
+    copy.className = 'subagent-stack-copy';
+    const goal = document.createElement('strong');
+    goal.textContent = item.goal;
+    goal.title = item.goal;
+    const tool = document.createElement('span');
+    const modelBit = String(item.model || '').split('/').pop();
+    tool.textContent = item.currentTool || modelBit || item.status;
+    copy.append(goal, tool);
+    const meta = document.createElement('span');
+    meta.className = 'subagent-stack-meta';
+    meta.textContent = `${item.status} · ${formatSubagentElapsed(item.startedAt)}`;
+    row.append(pulse, copy, meta);
+    row.addEventListener('click', () => {
+      subagentSelectedId = subagentSelectedId === item.id ? '' : item.id;
+      subagentControlError = '';
+      renderSubagentStack();
+    });
+    return row;
+  });
+  els.subagentStackList.replaceChildren(...rows);
+  els.subagentStackList.scrollTop = listScrollTop;
+  const selected = live.find((item) => item.id === subagentSelectedId);
+  if (!els.subagentStackDetail) return;
+  if (!selected || !subagentExpanded) {
+    els.subagentStackDetail.hidden = true;
+    els.subagentStackDetail.replaceChildren();
+    return;
+  }
+  els.subagentStackDetail.hidden = false;
+  const stream = document.createElement('ol');
+  stream.className = 'subagent-stack-stream';
+  for (const entry of selected.stream || []) {
+    const line = document.createElement('li');
+    if (entry.isError) line.className = 'is-error';
+    line.textContent = entry.text || '';
+    stream.append(line);
+  }
+  const controls = document.createElement('div');
+  controls.className = 'subagent-stack-controls';
+  const input = document.createElement('input');
+  input.id = 'subagentSteerInput';
+  input.type = 'text';
+  input.autocomplete = 'off';
+  input.placeholder = selected.acceptingSteer === false ? 'Not accepting steer' : 'Steer this subagent';
+  input.value = subagentSteerDraft;
+  input.disabled = subagentControlBusy || selected.acceptingSteer === false;
+  input.addEventListener('input', () => {
+    subagentSteerDraft = input.value;
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void runSelectedSubagentControl('steer', subagentSteerDraft);
+    }
+  });
+  const steerButton = document.createElement('button');
+  steerButton.type = 'button';
+  steerButton.className = 'subagent-stack-icon';
+  steerButton.title = 'Steer this subagent';
+  steerButton.setAttribute('aria-label', 'Steer this subagent');
+  steerButton.innerHTML = SUBAGENT_STEER_ICON;
+  steerButton.disabled = subagentControlBusy || selected.acceptingSteer === false;
+  steerButton.addEventListener('click', () => {
+    void runSelectedSubagentControl('steer', subagentSteerDraft);
+  });
+  const stopButton = document.createElement('button');
+  stopButton.type = 'button';
+  stopButton.className = 'subagent-stack-icon';
+  stopButton.title = 'Stop this subagent';
+  stopButton.setAttribute('aria-label', 'Stop this subagent');
+  stopButton.textContent = SUBAGENT_STOP_ICON;
+  stopButton.disabled = subagentControlBusy;
+  stopButton.addEventListener('click', () => {
+    void runSelectedSubagentControl('interrupt');
+  });
+  controls.append(input, steerButton, stopButton);
+  els.subagentStackDetail.replaceChildren(stream, controls);
+  if (subagentControlError) {
+    const error = document.createElement('p');
+    error.className = 'subagent-stack-error';
+    error.textContent = subagentControlError;
+    els.subagentStackDetail.append(error);
+  }
+  if (keepFocus) input.focus({ preventScroll: true });
+  stream.scrollTop = streamScrollTop;
+  stream.scrollLeft = streamScrollLeft;
 }
 
 async function captureTaskToolEvent(event) {
@@ -1796,9 +2125,95 @@ function renderLiveRun() {
   els.messageList.append(card);
 }
 
+function webHistoryMediaMessages(messages = []) {
+  return (Array.isArray(messages) ? messages : []).map((message) => {
+    const extracted = extractHistoryMediaAttachments(message);
+    if (!extracted.length || normalizeUserImageAttachments(message.attachments).length) return message;
+    return { ...message, attachments: extracted };
+  });
+}
+
+async function hydrateSessionMedia(messageList = []) {
+  const pending = [];
+  for (const message of Array.isArray(messageList) ? messageList : []) {
+    const extracted = extractHistoryMediaAttachments(message);
+    if (extracted.length && !normalizeUserImageAttachments(message.attachments).length) {
+      message.attachments = [...(Array.isArray(message.attachments) ? message.attachments : []), ...extracted];
+    }
+    if (!Array.isArray(message?.attachments)) continue;
+    for (const attachment of message.attachments) {
+      if (!attachment || attachment.dataUrl || !attachment.pathRef) continue;
+      if (resolveMediaFetchPlan({ pathRef: attachment.pathRef }).transport !== 'dashboard-media') continue;
+      pending.push(attachment);
+    }
+  }
+  if (!pending.length) return;
+  const baseUrl = dashboardModelDiscoveryBaseUrl({
+    gatewayMode: settings.gatewayMode,
+    gatewayUrl: settings.gatewayUrl,
+  });
+  if (!baseUrl) return;
+  const token = await fetchDashboardSessionToken({ baseUrl });
+  await Promise.all(pending.map(async (attachment) => {
+    const dataUrl = await fetchDashboardMediaDataUrl({
+      baseUrl,
+      filePath: attachment.pathRef,
+      token,
+    });
+    if (dataUrl) attachment.dataUrl = dataUrl;
+  }));
+}
+
+async function hydrateSessionMediaInElement(element) {
+  if (!element?.querySelectorAll) return;
+  const nodes = [...element.querySelectorAll('[data-session-media][data-media-path]')];
+  if (!nodes.length) return;
+  const baseUrl = dashboardModelDiscoveryBaseUrl({
+    gatewayMode: settings.gatewayMode,
+    gatewayUrl: settings.gatewayUrl,
+  });
+  if (!baseUrl) {
+    for (const node of nodes) node.classList.add('unavailable');
+    return;
+  }
+  const token = await fetchDashboardSessionToken({ baseUrl });
+  const doc = element.ownerDocument || document;
+  await Promise.all(nodes.map(async (node) => {
+    if (!node.isConnected) return;
+    const filePath = node.getAttribute('data-media-path') || '';
+    const kind = node.getAttribute('data-session-media') || classifyMediaKind(filePath);
+    const plan = resolveMediaFetchPlan({ pathRef: filePath });
+    if (kind === 'image' && plan.transport === 'dashboard-media') {
+      const dataUrl = await fetchDashboardMediaDataUrl({ baseUrl, filePath, token });
+      if (!dataUrl) {
+        node.classList.add('unavailable');
+        return;
+      }
+      const image = doc.createElement('img');
+      image.src = dataUrl;
+      image.alt = filePath.split(/[\\/]/).pop() || 'Image';
+      image.loading = 'lazy';
+      node.replaceWith(image);
+      return;
+    }
+    if (kind === 'video' && plan.transport === 'dashboard-stream') {
+      const video = doc.createElement('video');
+      video.className = 'session-media-player';
+      video.controls = true;
+      video.preload = 'metadata';
+      video.src = dashboardFileStreamUrl(baseUrl, filePath, token);
+      video.addEventListener('error', () => {
+        node.classList.add('unavailable');
+        if (video.isConnected) video.replaceWith(node);
+      }, { once: true });
+      node.replaceWith(video);
+    }
+  }));
+}
+
 function renderMessages(messages = []) {
   const recoveredImageSources = resolvedGeneratedImageSourcesFromMessages(messages);
-  const renderedMessages = appendGeneratedImageSourcesToMessages(messages, recoveredImageSources);
+  const renderedMessages = webHistoryMediaMessages(appendGeneratedImageSourcesToMessages(messages, recoveredImageSources));
   activeMessages = renderedMessages;
   els.messageList.replaceChildren();
   const visible = browserDisplayMessages(renderedMessages)
@@ -1821,8 +2236,14 @@ function renderMessages(messages = []) {
     const media = resolvedGeneratedImageSources(visibleText);
     const displayText = stripGeneratedImageEchoes(tagged.text, media);
     if (displayText) {
-      content.innerHTML = renderMarkdownSafe(displayText);
-      highlightCodeBlocks(content);
+      const rendered = document.createElement('div');
+      rendered.innerHTML = renderMarkdownSafe(displayText);
+      highlightCodeBlocks(rendered);
+      content.append(...rendered.childNodes);
+      enhanceMarkdownCodeBlocks(content, {
+        copyLabel: translateUiText('Copy code'),
+        copiedLabel: translateUiText('Copied'),
+      });
     }
     if (role === 'user') {
       appendUserImageAttachments(content, message.attachments, {
@@ -1860,6 +2281,8 @@ function renderMessages(messages = []) {
       content.append(group);
     }
     for (const item of tagged.media.filter((entry) => !resolveImageSource(entry.source))) {
+      const kind = classifyMediaKind(item.source);
+      if (kind === 'image' || kind === 'video') continue;
       content.append(renderArtifactCard(describeArtifact(item.source)));
     }
     article.append(roleNode, content);
@@ -1868,6 +2291,16 @@ function renderMessages(messages = []) {
   renderLiveRun();
   renderContextWindow();
   requestAnimationFrame(() => { els.conversationScroll.scrollTop = els.conversationScroll.scrollHeight; });
+  const alreadyHydrated = renderedMessages.some((message) => (message.attachments || []).some((item) => item.dataUrl && item.pathRef));
+  void (async () => {
+    await hydrateSessionMedia(renderedMessages);
+    const nowHydrated = renderedMessages.some((message) => (message.attachments || []).some((item) => item.dataUrl && item.pathRef));
+    if (nowHydrated && !alreadyHydrated) {
+      renderMessages(renderedMessages);
+      return;
+    }
+    await hydrateSessionMediaInElement(els.messageList);
+  })();
 }
 
 function effectiveModel() {
@@ -2355,6 +2788,24 @@ async function refreshModelsFromPicker() {
 }
 
 async function loadSkills({ quiet = false } = {}) {
+  if (usesDashboardTicketTransport()) {
+    try {
+      const connection = await ensureDashboardConnection();
+      const profile = String(settings.activeProfile || 'default').trim() || 'default';
+      const payload = await connection.client.request(WS_METHODS.profilesDescribe, { name: profile });
+      availableSkills = normalizeHermesSkills({ data: payload?.skills || [] });
+      renderComposerSuggestions();
+      if (!quiet) els.composerStatus.textContent = `${availableSkills.length} skills synced`;
+      return { ok: true, count: availableSkills.length, source: 'dashboard-ws' };
+    } catch (error) {
+      if (!settings.apiKey) {
+        availableSkills = [];
+        renderComposerSuggestions();
+        if (!quiet) els.composerStatus.textContent = `Skill sync failed: ${error?.message || String(error)}`;
+        return { ok: false, count: 0, error: error?.message || String(error) };
+      }
+    }
+  }
   try {
     const response = await client.fetch('/v1/skills', { method: 'GET' });
     const payload = await client.readJson(response);
@@ -3370,6 +3821,58 @@ function readFile(file, method) {
   });
 }
 
+function persistCurrentComposerDraft({ immediate = false } = {}) {
+  if (restoringComposerDraft) return;
+  const run = () => {
+    composerDraftSaveTimer = 0;
+    persistComposerDraft(globalThis.sessionStorage || null, {
+      instanceId: WEB_COMPOSER_DRAFT_INSTANCE,
+      text: els.prompt?.value || '',
+      attachments,
+    });
+  };
+  if (immediate) {
+    if (composerDraftSaveTimer) {
+      clearTimeout(composerDraftSaveTimer);
+      composerDraftSaveTimer = 0;
+    }
+    run();
+    return;
+  }
+  if (composerDraftSaveTimer) return;
+  composerDraftSaveTimer = setTimeout(run, 200);
+}
+
+function forgetComposerDraft() {
+  if (composerDraftSaveTimer) {
+    clearTimeout(composerDraftSaveTimer);
+    composerDraftSaveTimer = 0;
+  }
+  clearComposerDraft(globalThis.sessionStorage || null, { instanceId: WEB_COMPOSER_DRAFT_INSTANCE });
+}
+
+function restoreComposerDraft() {
+  const draft = loadComposerDraft(globalThis.sessionStorage || null, { instanceId: WEB_COMPOSER_DRAFT_INSTANCE });
+  if (!draft) return false;
+  restoringComposerDraft = true;
+  try {
+    if (els.prompt && !String(els.prompt.value || '').trim() && draft.text) {
+      els.prompt.value = draft.text;
+    }
+    if (!attachments.length && draft.attachments.length) {
+      attachments = draft.attachments.map((item) => ({
+        ...item,
+        name: item.name || item.label || 'attachment',
+      }));
+    }
+    renderAttachments();
+    updateBusyControls();
+    return true;
+  } finally {
+    restoringComposerDraft = false;
+  }
+}
+
 function renderAttachments() {
   els.attachmentList.replaceChildren();
   els.attachmentList.hidden = attachments.length === 0;
@@ -3385,6 +3888,7 @@ function renderAttachments() {
     remove.addEventListener('click', () => {
       attachments = attachments.filter((item) => item.id !== attachment.id);
       renderAttachments();
+      persistCurrentComposerDraft({ immediate: true });
     });
     chip.append(label, remove);
     els.attachmentList.append(chip);
@@ -3400,6 +3904,7 @@ async function attachFiles(fileList) {
     attachments.push({ id: `${Date.now()}:${Math.random()}`, kind: image ? 'image' : 'file', name: file.name || 'attachment', size: file.size, type: file.type, text: text.slice(0, 120_000), dataUrl });
   }
   renderAttachments();
+  persistCurrentComposerDraft({ immediate: true });
   els.prompt.focus();
 }
 
@@ -3492,11 +3997,46 @@ async function handleAttachAction(action) {
   else if (action === 'snippet') insertPromptSnippet();
 }
 
-function attachmentPrompt() {
+function attachmentPrompt({ inlineImageData = !usesDashboardTicketTransport() } = {}) {
   if (!attachments.length) return '';
   return `\n\n[ATTACHMENTS]\n${attachments.map((item, index) => item.kind === 'image'
-    ? `Image ${index + 1}: ${item.name}\nInline image data: ${item.dataUrl}`
+    ? (inlineImageData
+      ? `Image ${index + 1}: ${item.name}\nInline image data: ${item.dataUrl}`
+      : `Image ${index + 1}: ${item.name}\nUploaded to the live Hermes session; vision opens the saved file.`)
     : `File ${index + 1}: ${item.name}\n${item.text || '[binary file metadata only]'}`).join('\n\n')}\n[/ATTACHMENTS]`;
+}
+
+// Dashboard turns carry no pixels through `prompt.submit`, so pasted images must
+// ride the gateway's session-scoped `image.attach_bytes` RPC (the same contract
+// Hermes Desktop uses) before the prompt submits. The gateway writes the file
+// next to the session, queues it, and the next prompt.submit routes it into the
+// run so the model can actually open the screenshot.
+async function attachDashboardPromptImages(client, sessionId, items = []) {
+  const pending = items.filter((attachment) => attachment.kind === 'image'
+    && attachment.dataUrl
+    && attachment.dashboardAttachedSessionId !== sessionId);
+  if (!pending.length || !client || !sessionId) return items;
+  let attached = 0;
+  for (const attachment of pending) {
+    try {
+      const result = await client.request(WS_METHODS.imageAttachBytes, {
+        session_id: sessionId,
+        content_base64: attachment.dataUrl,
+        filename: attachment.name || 'image.png',
+      });
+      if (result?.attached !== true) throw new Error(result?.message || 'Hermes did not confirm the image attach.');
+      attachment.dashboardAttachedSessionId = sessionId;
+      if (result.path) attachment.localPath = result.path;
+      attached += 1;
+    } catch (error) {
+      attachment.uploadError = error?.message || String(error);
+      console.warn('[Hermes Browser] Image attach failed:', attachment.name || 'image', error);
+    }
+  }
+  if (attached && els.composerStatus) {
+    els.composerStatus.textContent = translateUiText('Image attached for Hermes vision');
+  }
+  return items;
 }
 
 function voicePagePath() {
@@ -3530,6 +4070,7 @@ function renderWakeState(state = {}) {
   els.wakeButton.setAttribute('aria-pressed', String(active));
   els.wakeButton.classList.toggle('active', active);
   els.wakeButton.title = state.detail || translateUiText(active ? 'Hey Hermes is listening' : 'Enable Hey Hermes');
+  els.wakeButton.hidden = !(state.enabled || settings.wakeWordEnabled);
 }
 
 async function toggleWakeWord() {
@@ -3604,6 +4145,7 @@ function queueCurrentDraft() {
   els.prompt.value = '';
   attachments = [];
   renderAttachments();
+  forgetComposerDraft();
   els.composerStatus.textContent = translateUiText('Message queued');
   updateBusyControls();
 }
@@ -4155,6 +4697,7 @@ async function sendPrompt(text) {
   els.composer.dataset.submitState = 'accepted';
   els.prompt.value = '';
   renderContextWindow();
+  forgetComposerDraft();
   const turnRunControlGeneration = ++runControlGeneration;
   activeRunControl = beginRunControl({
     runId: usesDashboardTicketTransport() ? String(dashboardLiveSessionId || '') : '',
@@ -4197,6 +4740,7 @@ async function sendPrompt(text) {
     if (usesDashboardTicketTransport()) {
       const streamedAnswer = await streamDashboardPrompt(prompt, {
         signal: activeAbortController.signal,
+        attachments: turnAttachments,
         onDelta: (content) => {
           assistant.content = content;
           if (isRenderableAssistantMessage(assistant) && !activeMessages.includes(assistant)) activeMessages = [...activeMessages, assistant];
@@ -4440,6 +4984,60 @@ async function commitFullTabSessionMessages(messages = [], { sessionId, requestI
   return true;
 }
 
+let completionRevealSequence = 0;
+
+// Async delegation completion replies land through history reconciliation (no
+// live token stream attached), so a plain commit popped the finished reply in
+// fully formed. Reveal the new trailing reply with the same progressive
+// updates live turns use, then normalize the transcript once at the end.
+async function commitFullTabSessionMessagesWithReveal(rows = [], options = {}) {
+  const reply = newestAssistantReply(trailingNewMessages(activeMessages, rows));
+  const committed = commitFullTabSessionMessages(rows, options);
+  if (!committed || !reply || document.hidden) return committed;
+  const nodes = els.messageList.querySelectorAll('.web-message.assistant');
+  const node = nodes.length ? nodes[nodes.length - 1] : null;
+  if (node) revealWebCompletionReply(node, reply);
+  return committed;
+}
+
+function revealWebCompletionReply(node, fullText) {
+  // Reveal the same display text the committed renderer used, so the tail
+  // matches exactly when the reveal finishes.
+  const text = String(messageDisplayText('assistant', fullText) || '');
+  const plan = completionRevealPlan(text);
+  if (!text || !plan.total) return;
+  const content = node.querySelector('.web-message-content');
+  if (!content) return;
+  const token = ++completionRevealSequence;
+  const scroller = els.conversationScroll;
+  const paint = (piece) => {
+    const rendered = document.createElement('div');
+    rendered.innerHTML = renderMarkdownSafe(piece);
+    content.replaceChildren(...rendered.childNodes);
+    if (scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  };
+  paint(revealSlice(text, plan.initialCount));
+  const startedAt = performance.now();
+  const step = (now) => {
+    if (token !== completionRevealSequence || !node.isConnected || sending) {
+      // Superseded, detached, or a new live turn started — normalize fully.
+      renderMessages(activeMessages);
+      return;
+    }
+    const progress = Math.min(1, (now - startedAt) / plan.durationMs);
+    if (progress >= 1) {
+      renderMessages(activeMessages);
+      return;
+    }
+    const eased = 1 - Math.pow(1 - progress, 2.4);
+    paint(revealSlice(text, Math.max(1, Math.floor(plan.total * eased))));
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 async function openSession(sessionId, { keepLoading = false } = {}) {
   if (!canSwitchActiveSession({ sending, runControl: activeRunControl })) {
     els.composerStatus.textContent = translateUiText('Stop the active run before switching sessions.');
@@ -4539,6 +5137,7 @@ async function loadApp() {
       renderConnectionTruth({ status: 'online' });
       const metadataPromise = Promise.all([
         loadWebBotModeProfiles(),
+        loadSkills({ quiet: true }),
         connection.client.request(WS_METHODS.modelOptions, {}).then((modelOptions) => {
           const discoveredModels = modelRowsFromGatewayOptions(modelOptions || {});
           if (!discoveredModels.length) return;
@@ -4749,6 +5348,7 @@ els.prompt.addEventListener('input', () => {
   updateBusyControls();
   renderComposerSuggestions();
   renderContextWindow();
+  persistCurrentComposerDraft();
 });
 els.prompt.addEventListener('paste', (event) => {
   handleComposerPaste(event).catch((error) => { els.composerStatus.textContent = `Paste failed: ${error?.message || String(error)}`; });
@@ -4804,6 +5404,10 @@ els.settingsLanguageSelect?.addEventListener('change', () => {
 els.taskStackToggle?.addEventListener('click', () => {
   taskStackExpanded = !taskStackExpanded;
   renderTaskStack();
+});
+els.subagentStackToggle?.addEventListener('click', () => {
+  subagentExpanded = !subagentExpanded;
+  renderSubagentStack();
 });
 els.closeSettings.addEventListener('click', () => els.settingsDialog.close());
 els.settingsDialog.addEventListener('click', (event) => {
@@ -5082,6 +5686,7 @@ initializeResponsiveShell();
 updateScrim();
 loadApp()
   .then(async () => {
+    restoreComposerDraft();
     renderWakeState(await browserApi.runtime.sendMessage({ type: WAKE_MESSAGES.getState }).catch(() => ({})));
     await consumePendingVoiceDraft();
     await consumePendingWakeTurn();

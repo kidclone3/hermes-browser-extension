@@ -24,5 +24,12 @@ test('readAllPetAvatars returns only persisted profile selections', async () => 
 
 test('readAllPetAvatars has no hardcoded identity fallback', async () => {
   assert.deepEqual(await readAllPetAvatars(undefined), {});
+});
+
+test('avatar roster has no synthetic default when storage is unavailable', async () => {
+  assert.deepEqual(await readAllPetAvatars(null), {});
+});
+
+test('avatar roster tolerates a storage failure without inventing profiles', async () => {
   assert.deepEqual(await readAllPetAvatars({ get: async () => { throw new Error('unavailable'); } }), {});
 });

@@ -47,7 +47,7 @@
         <div class="topbar-actions">
           <button id="returnToPageButton" class="text-control" type="button" hidden data-i18n="ui.return.to.page">Return to page</button>
           <button id="railVisibilityToggle" class="icon-control" type="button" aria-label="Hide sessions rail" aria-pressed="false" title="Hide sessions rail" data-i18n-title="ui.hide.sessions.rail" data-i18n-aria-label="ui.hide.sessions.rail">◧</button>
-          <button id="wakeButton" class="icon-control" type="button" aria-label="Toggle Hey Hermes" aria-pressed="false" title="Hey Hermes" data-i18n-aria-label="ui.toggle.hey.hermes">◉</button>
+          <button id="wakeButton" class="icon-control" type="button" hidden aria-label="Toggle Hey Hermes" aria-pressed="false" title="Hey Hermes" data-i18n-aria-label="ui.toggle.hey.hermes">◉</button>
           <button id="settingsButton" class="icon-control" type="button" aria-label="Open Hermes Web settings" title="Settings" data-i18n-title="ui.settings" data-i18n-aria-label="ui.open.hermes.web.settings">⚙</button>
           <button id="inspectorToggle" class="icon-control" type="button" aria-label="Toggle inspector" aria-expanded="true" data-i18n-aria-label="ui.toggle.inspector">◫</button>
         </div>
@@ -143,6 +143,15 @@
               <span class="task-stack-chevron" aria-hidden="true">↑</span>
             </button>
             <ol id="taskStackList" class="task-stack-list"></ol>
+          </section>
+          <section id="subagentStack" class="task-stack subagent-stack" data-expanded="true" aria-label="Hermes subagent status" hidden>
+            <button id="subagentStackToggle" class="task-stack-toggle" type="button" aria-expanded="true">
+              <span class="task-stack-title"><span class="subagent-stack-spinner" aria-hidden="true"><span class="subagent-stack-spinner-strip"><span>⠋</span><span>⠙</span><span>⠹</span><span>⠸</span><span>⠼</span><span>⠴</span><span>⠦</span><span>⠧</span><span>⠇</span><span>⠏</span></span></span> SUBAGENTS</span>
+              <span id="subagentStackSummary" class="task-stack-summary" aria-live="polite"></span>
+              <span class="task-stack-chevron" aria-hidden="true">↑</span>
+            </button>
+            <ol id="subagentStackList" class="task-stack-list subagent-stack-list" role="listbox" aria-label="Live subagents"></ol>
+            <div id="subagentStackDetail" class="subagent-stack-detail" hidden></div>
           </section>
           <form id="fullTabComposer" class="fulltab-composer" aria-label="Hermes message composer" data-i18n-aria-label="ui.hermes.message.composer">
             <div class="composer-topline">
